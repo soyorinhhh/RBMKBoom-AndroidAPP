@@ -5,8 +5,6 @@
         <SeekBarPreference
             app:key="sensitivity"
             app:title="灵敏度"
-            app:min="5"
-            app:max="30"
             app:defaultValue="10"
             app:showSeekBarValue="false" />
         <SwitchPreferenceCompat
