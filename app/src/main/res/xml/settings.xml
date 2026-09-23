@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<PreferenceScreen xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <PreferenceCategory app:title="音频响应">
+        <SeekBarPreference
+            app:key="sensitivity"
+            app:title="灵敏度"
+            app:min="5"
+            app:max="30"
+            app:defaultValue="10"
+            app:showSeekBarValue="false" />
+        <SwitchPreferenceCompat
+            app:key="adaptiveGain"
+            app:title="自适应增益"
+            app:summary="安静时自动放大，避免神经质"
+            app:defaultValue="true" />
+    </PreferenceCategory>
+
+    <PreferenceCategory app:title="性能与手感">
+        <ListPreference
+            app:key="fps"
+            app:title="帧率"
+            app:entries="@array/fps_labels"
+            app:entryValues="@array/fps_values"
+            app:defaultValue="15" />
+        <ListPreference
+            app:key="feel"
+            app:title="物理手感"
+            app:entries="@array/feel_labels"
+            app:entryValues="@array/feel_values"
+            app:defaultValue="NORMAL" />
+    </PreferenceCategory>
+
+    <PreferenceCategory app:title="视觉">
+        <ListPreference
+            app:key="rodDensity"
+            app:title="控制棒密度"
+            app:entries="@array/density_labels"
+            app:entryValues="@array/density_values"
+            app:defaultValue="NORMAL" />
+        <ListPreference
+            app:key="theme"
+            app:title="配色主题"
+            app:entries="@array/theme_labels"
+            app:entryValues="@array/theme_values"
+            app:defaultValue="GREEN" />
+    </PreferenceCategory>
+</PreferenceScreen>
