@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string-array name="fps_labels">
+        <item>15 fps · 省电</item>
+        <item>20 fps · 平衡</item>
+        <item>30 fps · 顺滑</item>
+    </string-array>
+    <string-array name="fps_values">
+        <item>15</item>
+        <item>20</item>
+        <item>30</item>
+    </string-array>
+
+    <string-array name="feel_labels">
+        <item>软 · 慢回弹</item>
+        <item>标准</item>
+        <item>硬 · 快速抖动</item>
+        <item>混沌 · 失控</item>
+    </string-array>
+    <string-array name="feel_values">
+        <item>SOFT</item>
+        <item>NORMAL</item>
+        <item>HARD</item>
+        <item>CHAOS</item>
+    </string-array>
+
+    <string-array name="density_labels">
+        <item>稀疏</item>
+        <item>标准</item>
+        <item>密集</item>
+    </string-array>
+    <string-array name="density_values">
+        <item>SPARSE</item>
+        <item>NORMAL</item>
+        <item>DENSE</item>
+    </string-array>
+
+    <string-array name="theme_labels">
+        <item>经典绿</item>
+        <item>钴蓝</item>
+        <item>琥珀</item>
+        <item>CRT 荧光</item>
+        <item>单色</item>
+    </string-array>
+    <string-array name="theme_values">
+        <item>GREEN</item>
+        <item>COBALT</item>
+        <item>AMBER</item>
+        <item>CRT</item>
+        <item>MONO</item>
+    </string-array>
+</resources>
