@@ -7,7 +7,6 @@ import android.view.View
 import com.example.reactor.config.ReactorConfig
 import kotlin.math.cos
 import kotlin.math.sin
-import kotlin.math.sqrt
 
 class ReactorView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null, defStyle: Int = 0
@@ -15,12 +14,12 @@ class ReactorView @JvmOverloads constructor(
 
     // 3D 场景里的单个方块节点
     class Node {
-        var angle = 0f        // 极坐标角度
-        var radiusRatio = 0f  // 距离中心的半径比例 (0.0 中心 -> 1.0 边缘)
-        var x3d = 0f          // 预计算的 3D 坐标
+        var angle = 0f
+        var radiusRatio = 0f
+        var x3d = 0f
         var y3d = 0f
-        var z = 0f            // 高度（音频驱动）
-        var vz = 0f           // 高度速度
+        var z = 0f
+        var vz = 0f
     }
 
     private var nodes = ArrayList<Node>()
@@ -45,7 +44,7 @@ class ReactorView @JvmOverloads constructor(
     // 3D 场景配置
     private val ringCount = 7
     private val maxRadius = 320f * density
-    private val tiltAngle = 55f * (Math.PI / 180f).toFloat() // 倾斜 55 度
+    private val tiltAngle = 55f * (Math.PI / 180f).toFloat()
 
     fun applyConfig(cfg: ReactorConfig) {
         spring = cfg.feel.spring
@@ -53,7 +52,6 @@ class ReactorView @JvmOverloads constructor(
         colorLow = cfg.theme.low
         colorMid = cfg.theme.mid
         colorHigh = cfg.theme.high
-        // 密度在 3D 模式下由环形分布固定，这里留空
         invalidate()
     }
 
@@ -73,22 +71,28 @@ class ReactorView @JvmOverloads constructor(
         invalidate()
     }
 
-    // 音频数据更新 -> 物理运动 -> 重绘
+    fun reset() {
+        exploded = false; explodeT = 0f; flash = 0f
+        pressure = 0f; overload = 0f; shake = 0f
+        for (node in nodes) {
+            node.z = 0f; node.vz = 0f
+        }
+        invalidate()
+    }
+
     fun update(s: FloatArray, dt: Float) {
         val n = nodes.size
         if (n == 0 || s.isEmpty()) return
         var sum = 0f
         for (i in 0 until n) {
             val node = nodes[i]
-            // 内圈（radiusRatio小）分配低频，外圈分配高频
             val bandIdx = (node.radiusRatio * (s.size - 1)).toInt().coerceIn(0, s.size - 1)
-            val targetZ = (s[bandIdx] * 150f).coerceIn(0f, 200f) // 高度缩放
+            val targetZ = (s[bandIdx] * 150f).coerceIn(0f, 200f)
 
             node.vz += (targetZ - node.z) * spring
             node.vz *= damping
             node.z += node.vz
             
-            // 防止穿模
             if (node.z < 0f) { node.z = 0f; node.vz *= -0.25f }
             sum += node.z
         }
@@ -107,21 +111,16 @@ class ReactorView @JvmOverloads constructor(
         buildNodes()
     }
 
-    // 构建 3D 网格节点
     private fun buildNodes() {
         nodes.clear()
-        val centerX = width / 2f
-        val centerY = height * 0.75f // 稍微往下移，制造纵深感
-
         for (r in 1..ringCount) {
             val radiusRatio = r.toFloat() / ringCount
-            val count = (6 + r * 6) // 越往外圈，方块越多
+            val count = (6 + r * 6)
             for (i in 0 until count) {
                 val node = Node()
                 node.radiusRatio = radiusRatio
                 node.angle = (i.toFloat() / count) * 2f * Math.PI.toFloat()
                 
-                // 计算 3D 坐标
                 val radius = maxRadius * radiusRatio
                 node.x3d = radius * cos(node.angle)
                 node.y3d = radius * sin(node.angle)
@@ -145,25 +144,20 @@ class ReactorView @JvmOverloads constructor(
         val centerX = w / 2f
         val centerY = h * 0.75f
 
-        // 根据距离（y3d）排序，越远越先画（保证遮挡关系正确）
         nodes.sortWith(Comparator { a, b -> a.y3d.compareTo(b.y3d) })
 
         val cosTilt = cos(tiltAngle)
         val sinTilt = sin(tiltAngle)
 
         for (node in nodes) {
-            // 3D 投射到 2D（绕 X 轴旋转）
             val screenX = centerX + node.x3d
             val screenY = centerY + node.y3d * cosTilt - node.z * sinTilt
 
-            // 深度雾化效果
-            val depthFactor = (node.y3d / maxRadius + 1f) / 2f // 0(远) -> 1(近)
+            val depthFactor = (node.y3d / maxRadius + 1f) / 2f
             val alpha = (0.2f + depthFactor * 0.8f).coerceIn(0f, 1f)
 
-            // 方块大小根据深度和高度变化
             val size = (2f + depthFactor * 4f) * density * (1f + node.z / 150f)
 
-            // 根据高度计算颜色（模仿热力图）
             val col = rodColor(node.z / 150f)
             fillPaint.color = col
             fillPaint.alpha = (alpha * 255).toInt()
@@ -176,7 +170,6 @@ class ReactorView @JvmOverloads constructor(
                 fillPaint
             )
             
-            // 发光效果（只在高度高的时候显示）
             if (node.z > 50f) {
                 glowPaint.color = col
                 glowPaint.alpha = ((node.z - 50f) / 150f * 100).toInt().coerceIn(0, 100)
@@ -184,7 +177,6 @@ class ReactorView @JvmOverloads constructor(
             }
         }
 
-        // 中心光晕
         val glowRadius = maxRadius * 1.2f * (1f + pressure)
         val radial = RadialGradient(
             centerX, centerY, glowRadius,
