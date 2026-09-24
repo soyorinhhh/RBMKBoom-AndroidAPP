@@ -25,12 +25,12 @@ class CaptureSource(
     private val lock = Any()
 
     @Volatile private var running = false
-    @Volatile var adaptiveGain = true
+    @Volatile private var adaptiveGainEnabled = true
     private var gain = 1f
     private var worker: Thread? = null
     private var record: AudioRecord? = null
 
-    fun setAdaptiveGain(v: Boolean) { adaptiveGain = v }
+    fun setAdaptiveGain(v: Boolean) { adaptiveGainEnabled = v }
 
     fun start(): Boolean {
         if (running) return true
@@ -73,7 +73,7 @@ class CaptureSource(
                     if (n <= 0) { Thread.sleep(8); continue }
                     if (n < FFT_SIZE) continue
                     val bands = analyzer.analyze(buf, 0)
-                    if (adaptiveGain) applyGain(bands)
+                    if (adaptiveGainEnabled) applyGain(bands)
                     synchronized(lock) {
                         System.arraycopy(bands, 0, latest, 0, bandCount)
                     }
