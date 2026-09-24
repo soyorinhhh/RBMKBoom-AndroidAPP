@@ -98,7 +98,6 @@ class OverlayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        largeEnabled = !(intent?.getBooleanExtra("disableLarge", false) ?: false)
         startForegroundCompat()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         config = ReactorConfig.load(this)
@@ -126,6 +125,9 @@ class OverlayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent != null) {
+            largeEnabled = !(intent.getBooleanExtra("disableLarge", false))
+        }
         when (intent?.action) {
             ACTION_CAPTURE_READY -> {
                 val rc = intent.getIntExtra("resultCode", Activity.RESULT_CANCELED)
