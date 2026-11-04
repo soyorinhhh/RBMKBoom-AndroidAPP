@@ -1,6 +1,6 @@
 # 控制棒 · REACTOR
 
-纯原生 Android（Kotlin + Canvas）音频驱动悬浮声场。麦克风或设备内部音频 → FFT 频谱 → 桌面/悬浮窗上的立体模块阵列。（注意：100%vibe coding，初稿DeepSeek V4 ProC端，现DeepSeek V4.1 Flash Harness端）
+纯原生 Android（Kotlin + Canvas）音频驱动悬浮声场。麦克风或设备内部音频 → FFT 频谱 → 桌面/悬浮窗上的立体模块阵列。
 
 > 仓库原本是 AI 生成的第一版，能编译但存在启动崩溃与多处音频生命周期缺陷。本次是一次带审计的续写重构，[docs/AUDIT.md](docs/AUDIT.md) 记录了什么被改、为什么改。
 
@@ -74,6 +74,41 @@ app/src/main/java/com/example/reactor/
 **未验证**（没有真机，也没有模拟器）：Android 12 实机上的悬浮窗表现、三种音源的实际采集、ColorOS 后台策略下的存活、真机帧率。
 
 详见 [docs/AUDIT.md](docs/AUDIT.md) 末尾的验收对照表。
+
+## 发行签名
+
+正式版 APK 用固定密钥签名，所以**后续版本可以直接覆盖安装，不需要先卸载**（前提是一直从 Releases 下载）。
+
+`app/build.gradle` 会读这几个环境变量来签 release 包，没有就退回 debug 签名（CI 走的是这条路）：
+
+```bash
+export REACTOR_KEYSTORE=/path/to/reactor-release.jks
+export REACTOR_KEYSTORE_PASSWORD=...
+export REACTOR_KEY_ALIAS=reactor
+export REACTOR_KEY_PASSWORD=...
+./gradlew assembleRelease
+```
+
+当前发行证书指纹（SHA-256）：
+
+```
+43:4F:76:2F:F2:9E:7F:6F:D9:A9:84:2F:6E:41:D4:BB:B2:A1:53:D2:06:F9:0D:23:37:ED:03:16:A0:F7:D9:FE
+```
+
+> 密钥文件不在仓库里，只在使用者本机保存。CI 产出的是 debug 签名包，适合自己测试；
+> 要覆盖升级请用 Releases 里的正式包。
+
+## 更新记录
+
+### v2.0
+- 修复 Android 12 上 `startForeground` 传入 API 34 才有的 `specialUse` 类型导致的**启动闪退**
+- 修复麦克风/机内音频的读取错误处理、停止顺序、PCM16 兼容性
+- 重写 REACTOR 声场渲染（2.5D 模块阵列，替代原来的倾斜点阵）
+- 新增运行诊断面板与进程内运行日志（无 ADB 也能排查）
+- 修复横屏后悬浮窗消失、面板误关、使用情况权限误判等问题
+
+### v1.0
+- 首版（AI 生成）
 
 ## 许可
 

@@ -65,6 +65,9 @@ class OverlayService : Service() {
         private const val CHANNEL_ID = "reactor_overlay"
         private const val NOTI_ID = 1
 
+        /** 连续检测到 Launcher 几次才显示大窗，用于压制「闪现」。 */
+        private const val LAUNCHER_STREAK_REQUIRED = 2
+
         const val ACTION_CAPTURE_READY = "com.example.reactor.CAPTURE_READY"
         const val ACTION_REFRESH_BG = "com.example.reactor.REFRESH_BG"
         const val ACTION_TOGGLE_MIC = "com.example.reactor.TOGGLE_MIC"
@@ -107,6 +110,7 @@ class OverlayService : Service() {
 
     private var launcherPackage: String? = null
     private var onLauncher = false
+    private var launcherStreak = 0
     private var lastVisibilityCheck = 0L
     private var largeEnabled = true
     private var smallEnabled = true
@@ -481,15 +485,23 @@ class OverlayService : Service() {
         if (!canDetect && !usagePermissionWarned) {
             usagePermissionWarned = true
         }
-        val launcherVisible = canDetect && isLauncherForeground()
+        val launcherVisible = canDetect && screenOn && isLauncherForeground()
 
-        if (!force && launcherVisible == onLauncher) {
-            // 大小窗开关也可能变，这里仍然同步一次可见性
-            applyVisibility(launcherVisible)
+        // 防抖：启动器切换动画、ColorOS 的事件延迟都会让单次检测误判成「在桌面」，
+        // 大窗就会闪一下盖住别的应用。连续两次都判定在桌面才真正显示；离开立刻隐藏。
+        if (launcherVisible) {
+            if (launcherStreak < LAUNCHER_STREAK_REQUIRED) launcherStreak++
+        } else {
+            launcherStreak = 0
+        }
+        val effective = launcherVisible && launcherStreak >= LAUNCHER_STREAK_REQUIRED
+
+        if (!force && effective == onLauncher) {
+            applyVisibility(effective)
             return
         }
-        onLauncher = launcherVisible
-        applyVisibility(launcherVisible)
+        onLauncher = effective
+        applyVisibility(effective)
     }
 
     private fun applyVisibility(launcherVisible: Boolean) {
