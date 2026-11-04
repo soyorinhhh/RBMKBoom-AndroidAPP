@@ -1,6 +1,6 @@
 # 控制棒 · REACTOR
 
-纯原生 Android（Kotlin + Canvas）音频驱动悬浮声场。麦克风或设备内部音频 → FFT 频谱 → 桌面/悬浮窗上的立体模块阵列。
+纯原生 Android（Kotlin + Canvas）音频驱动悬浮声场。麦克风或设备内部音频 → FFT 频谱 → 桌面/悬浮窗上的立体模块阵列。（注意：100%vibe coding，初稿DeepSeek V4 ProC端，现DeepSeek V4.1 Flash Harness端）
 
 > 仓库原本是 AI 生成的第一版，能编译但存在启动崩溃与多处音频生命周期缺陷。本次是一次带审计的续写重构，[docs/AUDIT.md](docs/AUDIT.md) 记录了什么被改、为什么改。
 
