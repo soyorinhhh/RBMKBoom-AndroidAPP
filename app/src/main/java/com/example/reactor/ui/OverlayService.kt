@@ -13,6 +13,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.SharedPreferences
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.media.projection.MediaProjection
@@ -37,6 +38,8 @@ import com.example.reactor.audio.AudioEngine
 import com.example.reactor.audio.AudioStatus
 import com.example.reactor.audio.SourceKind
 import com.example.reactor.config.ReactorConfig
+import com.example.reactor.util.AppLog
+import com.example.reactor.util.UsageAccess
 import kotlin.concurrent.thread
 import kotlin.math.abs
 
@@ -96,6 +99,7 @@ class OverlayService : Service() {
     private var config = ReactorConfig()
     private var lastFrameMs = 0L
     private var frameScheduled = false
+    private var watchdogCountdown = 0
 
     private var projection: MediaProjection? = null
     private var projectionCallback: MediaProjection.Callback? = null
@@ -155,6 +159,7 @@ class OverlayService : Service() {
     override fun onCreate() {
         super.onCreate()
         isRunning = true
+        AppLog.add("服务", "onCreate start，SDL=${Build.VERSION.SDK_INT}")
         startAsForeground()
 
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
@@ -379,6 +384,9 @@ class OverlayService : Service() {
             setBackgroundColor(Color.TRANSPARENT)
             isClickable = false
             isFocusable = false
+            // 关键：一开始就是 GONE。首版加窗时默认 VISIBLE，要等第一次可见性检测
+            // （最多 800ms 后）才隐藏，于是会在非桌面场景闪一下、把桌面挡一瞬间。
+            visibility = View.GONE
         }
         largeReactor = ReactorView(this)
         largeRoot.addView(
@@ -420,8 +428,10 @@ class OverlayService : Service() {
     private fun addWindowSafely(view: View, params: WindowManager.LayoutParams, name: String): Boolean {
         return try {
             windowManager.addView(view, params)
+            AppLog.add("窗口", "$name 已添加 ${params.width}x${params.height}")
             true
         } catch (e: Exception) {
+            AppLog.add("窗口", "$name 添加失败：${e.javaClass.simpleName} ${e.message ?: ""}")
             Log.e(TAG, "$name 添加失败", e)
             false
         }
@@ -438,15 +448,7 @@ class OverlayService : Service() {
         }
     }
 
-    private fun hasUsagePermission(): Boolean {
-        val usm = getSystemService(UsageStatsManager::class.java) ?: return false
-        return try {
-            val end = System.currentTimeMillis()
-            !usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, end - 1000, end).isNullOrEmpty()
-        } catch (_: Exception) {
-            false
-        }
-    }
+    private fun hasUsagePermission(): Boolean = UsageAccess.has(this)
 
     private fun isLauncherForeground(): Boolean =
         launcherPackage?.let { pkg ->
@@ -555,7 +557,13 @@ class OverlayService : Service() {
     }
 
     private fun showPanel() {
+        // 再长按一次收起，避免面板一直挂在屏幕上
+        if (panel.isShowing()) {
+            panel.hide()
+            return
+        }
         vibrate(18)
+        AppLog.add("面板", "长按呼出，当前音源=${engine.currentMode().cn}")
         panel.setBgState(BackgroundManager.getUri(this) != null)
         panel.setSourceState(engine.currentMode())
         panel.show(smallParams.x, smallParams.y, smallParams.width, smallParams.height, windowManager)
@@ -564,10 +572,12 @@ class OverlayService : Service() {
     // ==================== 交互 ====================
 
     private fun handlePanelAction(action: QuickPanel.Action) {
+        AppLog.add("面板", "点击 $action")
+        var closeAfter = true
         when (action) {
             QuickPanel.Action.TOGGLE_MIC -> enableMic()
             QuickPanel.Action.TOGGLE_CAPTURE -> toggleCapture()
-            QuickPanel.Action.PICK_BG -> openMain("pick_background")
+            QuickPanel.Action.PICK_BG -> closeAfter = openMain("pick_background")
             QuickPanel.Action.CLEAR_BG -> {
                 BackgroundManager.setUri(this, null)
                 BackgroundManager.setEnabled(this, false)
@@ -588,22 +598,37 @@ class OverlayService : Service() {
                 smallReactor.reset()
                 largeReactor.reset()
             }
-            QuickPanel.Action.SETTINGS -> openMain("settings")
-            QuickPanel.Action.CLOSE -> stopSelf()
+            QuickPanel.Action.SETTINGS -> closeAfter = openMain("settings")
+            QuickPanel.Action.CLOSE -> {
+                AppLog.add("面板", "用户主动退出悬浮窗")
+                stopSelf()
+            }
         }
-        panel.hide()
+        // 打开界面的动作如果被系统拦截，面板保持显示，避免「点了就没反应、选项还全没了」
+        if (closeAfter) panel.hide()
     }
 
-    private fun openMain(action: String) {
-        try {
+    /**
+     * 从悬浮窗拉起界面。
+     *
+     * Android 10+ 限制后台启动 Activity，国产 ROM 更严格。
+     * 首版直接 startActivity 且失败也只是吞异常，用户看到的就是「点了设置，面板消失，什么也没打开」。
+     * 这里返回是否成功，失败时提示用户手动打开。
+     */
+    private fun openMain(action: String): Boolean {
+        return try {
             startActivity(
                 Intent(this, MainActivity::class.java).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
                     putExtra("action", action)
                 }
             )
+            AppLog.add("交互", "打开主界面：$action")
+            true
         } catch (e: Exception) {
-            Log.w(TAG, "无法打开主界面", e)
+            AppLog.add("交互", "打开主界面失败：${e.javaClass.simpleName} ${e.message ?: ""}")
+            toast("系统拦截了后台启动，请手动打开「控制棒」")
+            false
         }
     }
 
@@ -754,15 +779,80 @@ class OverlayService : Service() {
 
             engine.snapshot(frameBuffer)
 
+            var needsLayoutSync = false
+            if (watchdogCountdown <= 0) {
+                watchdogCountdown = config.fps * 2      // 约每 2 秒体检一次
+                needsLayoutSync = ensureWindowsAttached()
+            } else {
+                watchdogCountdown--
+            }
+
             val largeVisible = largeRoot.visibility == View.VISIBLE
             val smallVisible = smallRoot.visibility == View.VISIBLE
             if (largeVisible) largeReactor.update(frameBuffer, dt)
             if (smallVisible) smallReactor.update(frameBuffer, dt)
 
-            updateLayerVisibility()
+            updateLayerVisibility(force = needsLayoutSync)
 
             handler.postDelayed(this, (1000L / config.fps).coerceAtLeast(16L))
         }
+    }
+
+    /**
+     * 看门狗：ColorOS 在旋转、切后台、权限变动时可能把 overlay 窗口摘掉，
+     * 而服务本身还活着 —— 表现就是「横屏后消失」。
+     * 这里定期确认窗口还挂在 WindowManager 上，掉了就重新加回去。
+     */
+    private fun ensureWindowsAttached(): Boolean {
+        var changed = false
+        if (::smallRoot.isInitialized && smallEnabled && !smallRoot.isAttachedToWindow) {
+            AppLog.add("窗口", "小窗不见了，重新添加")
+            if (addWindowSafely(smallRoot, smallParams, "小窗")) changed = true
+        }
+        if (::largeRoot.isInitialized && !largeRoot.isAttachedToWindow) {
+            AppLog.add("窗口", "大窗不见了，重新添加")
+            if (addWindowSafely(largeRoot, largeParams, "大窗")) changed = true
+        }
+        if (::panel.isInitialized && panel.root.isAttachedToWindow.not() && panel.isShowing()) {
+            AppLog.add("窗口", "面板不见了，重新添加")
+            addWindowSafely(panel.root, panel.lp, "面板")
+        }
+        return changed
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        AppLog.add("配置", "旋转/尺寸变化 → ${newConfig.orientation}")
+        handler.post { applyOrientation() }
+    }
+
+    /**
+     * 横竖屏切换后按新屏幕尺寸重排窗口。
+     * overlay 窗口用的是绝对像素坐标，不重排就会出现「横屏后跑到屏幕外」。
+     */
+    private fun applyOrientation() {
+        if (!::smallRoot.isInitialized || !::largeRoot.isInitialized) return
+        val metrics = resources.displayMetrics
+        val width = metrics.widthPixels
+        val height = metrics.heightPixels
+        val size = (150 * metrics.density).toInt()
+
+        val oldX = smallParams.x
+        val oldY = smallParams.y
+        val wasLeft = oldX + smallParams.width / 2 < width / 2
+
+        smallParams.width = size
+        smallParams.height = size
+        smallParams.x = if (wasLeft) (8 * metrics.density).toInt() else width - size - (8 * metrics.density).toInt()
+        smallParams.y = oldY.coerceIn(0, (height - size).coerceAtLeast(0))
+        safeUpdateLayout(smallRoot, smallParams)
+
+        // 大窗是 MATCH_PARENT，尺寸由系统给，这里只需要让它重画几何
+        largeReactor.reset()
+        smallReactor.reset()
+        lastVisibilityCheck = 0
+        updateLayerVisibility(force = true)
+        AppLog.add("配置", "已按 ${width}x${height} 重排，小窗(${smallParams.x},${smallParams.y})")
     }
 
     private fun startFrameLoop() {
@@ -857,6 +947,7 @@ class OverlayService : Service() {
     }
 
     override fun onDestroy() {
+        AppLog.add("服务", "onDestroy，音源=${engine.currentMode().cn}")
         isRunning = false
         stopFrameLoop()
         handler.removeCallbacksAndMessages(null)

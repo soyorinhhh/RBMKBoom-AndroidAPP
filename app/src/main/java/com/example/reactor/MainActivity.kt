@@ -21,6 +21,8 @@ import com.example.reactor.audio.AudioStatus
 import com.example.reactor.ui.BackgroundManager
 import com.example.reactor.ui.OverlayService
 import com.example.reactor.ui.SettingsActivity
+import com.example.reactor.util.AppLog
+import com.example.reactor.util.UsageAccess
 
 /**
  * 入口与权限中枢。
@@ -33,6 +35,7 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var statusText: TextView
     private lateinit var detailText: TextView
+    private lateinit var logText: TextView
     private val handler = Handler(Looper.getMainLooper())
 
     private var pendingStartLarge = true
@@ -109,6 +112,8 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
         statusText = findViewById(R.id.text_status)
         detailText = findViewById(R.id.text_detail)
+        logText = findViewById(R.id.text_log)
+        logText.setOnClickListener { copyLog() }
 
         findViewById<Button>(R.id.btn_start).setOnClickListener {
             startOverlayFlow()
@@ -161,6 +166,21 @@ class MainActivity : AppCompatActivity() {
             else -> snapshot.shortLine()
         }
         detailText.text = buildDetail(snapshot)
+
+        val lines = AppLog.tail(18)
+        logText.text = if (lines.isEmpty()) "（还没有日志）" else lines.joinToString("\n")
+    }
+
+    private fun copyLog() {
+        try {
+            val clipboard = getSystemService(android.content.ClipboardManager::class.java)
+            clipboard?.setPrimaryClip(
+                android.content.ClipData.newPlainText("reactor-log", AppLog.dump())
+            )
+            toast("日志已复制")
+        } catch (e: Exception) {
+            toast("复制失败：${e.javaClass.simpleName}")
+        }
     }
 
     private fun buildDetail(snapshot: com.example.reactor.audio.AudioDiagnostics?): String {
@@ -309,16 +329,7 @@ class MainActivity : AppCompatActivity() {
         if (!pendingStartLarge) finish()
     }
 
-    private fun hasUsagePermission(): Boolean {
-        val manager = getSystemService(android.app.usage.UsageStatsManager::class.java) ?: return false
-        return try {
-            val end = System.currentTimeMillis()
-            !manager.queryUsageStats(android.app.usage.UsageStatsManager.INTERVAL_DAILY, end - 1000, end)
-                .isNullOrEmpty()
-        } catch (_: Exception) {
-            false
-        }
-    }
+    private fun hasUsagePermission(): Boolean = UsageAccess.has(this)
 
     private fun startServiceAction(action: String) {
         startServiceCompat(Intent(this, OverlayService::class.java).setAction(action))

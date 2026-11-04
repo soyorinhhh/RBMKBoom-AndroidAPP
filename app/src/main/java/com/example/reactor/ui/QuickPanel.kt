@@ -64,6 +64,10 @@ class QuickPanel(
 
     init {
         root.addView(content)
+        // 顶部标题行 + 明确的关闭按钮。
+        // 之前最后一项是「关闭悬浮窗」，很容易误触把整个服务关掉，
+        // 看起来就像「面板一操作，所有选项都没了」。
+        addTitleRow()
         micItem = addItem("麦克风") { onAction(Action.TOGGLE_MIC) }
         captureItem = addItem("机内音频") { onAction(Action.TOGGLE_CAPTURE) }
         bgLabel = addItem("设置背景") { onAction(Action.PICK_BG) }
@@ -72,8 +76,36 @@ class QuickPanel(
         addItem("悬浮小窗 开/关") { onAction(Action.TOGGLE_SMALL) }
         addItem("重置动画") { onAction(Action.RESET) }
         addItem("设置") { onAction(Action.SETTINGS) }
-        addItem("关闭悬浮窗") { onAction(Action.CLOSE) }
+        addItem("退出悬浮窗") { onAction(Action.CLOSE) }
     }
+
+    private fun addTitleRow() {
+        val row = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(10), dp(8), dp(4))
+        }
+        row.addView(
+            TextView(context).apply {
+                text = "控制棒"
+                setTextColor(accent)
+                textSize = 12f
+            },
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        row.addView(
+            TextView(context).apply {
+                text = "✕"
+                setTextColor(dim)
+                textSize = 15f
+                setPadding(dp(14), dp(2), dp(8), dp(2))
+                setOnClickListener { hide() }
+            }
+        )
+        content.addView(row)
+    }
+
+    fun isShowing(): Boolean = root.visibility == View.VISIBLE
 
     private fun addItem(label: String, click: () -> Unit): TextView {
         val view = TextView(context).apply {
