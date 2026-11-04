@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">控制棒</string>
+    <string name="app_subtitle">REACTOR · 音频驱动悬浮声场</string>
+
+    <string name="btn_start">启动悬浮窗</string>
+    <string name="btn_stop">停止</string>
+    <string name="btn_settings">设置</string>
+    <string name="btn_permission">权限检查</string>
+
+    <string name="section_diagnostics">运行诊断</string>
+    <string name="label_status_idle">悬浮窗未运行</string>
+    <string name="notif_channel">控制棒悬浮窗</string>
+    <string name="notif_title">控制棒</string>
+</resources>

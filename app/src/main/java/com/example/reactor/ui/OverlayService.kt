@@ -1,6 +1,10 @@
 package com.example.reactor.ui
 
-import android.app.*
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
 import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.BroadcastReceiver
@@ -13,36 +17,69 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
-import android.os.*
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.SystemClock
+import android.provider.Settings
+import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.Toast
-import androidx.core.content.ContextCompat
+import androidx.core.app.NotificationCompat
 import com.example.reactor.MainActivity
-import com.example.reactor.audio.CaptureSource
-import com.example.reactor.audio.MicSource
-import com.example.reactor.audio.SynthSource
+import com.example.reactor.R
+import com.example.reactor.audio.AudioEngine
+import com.example.reactor.audio.AudioStatus
+import com.example.reactor.audio.SourceKind
 import com.example.reactor.config.ReactorConfig
 import kotlin.concurrent.thread
 import kotlin.math.abs
 
+/**
+ * 悬浮窗前台服务。
+ *
+ * 相比初版修掉的核心问题：
+ * 1. **前台服务类型**：初版在 API 29+ 无条件传 FOREGROUND_SERVICE_TYPE_SPECIAL_USE，
+ *    而这个常量是 API 34 才有的 —— 在 Android 12 上 startForeground 会直接抛
+ *    IllegalArgumentException，服务刚建就崩。现在按版本分级处理；
+ * 2. API 26–28 初版根本没有调用过 startForeground（只有 >= Q 的分支），
+ *    用 startForegroundService 启动会在 5 秒后抛 ANR 级异常；现在所有版本都会调用；
+ * 3. 麦克风需要先升级前台服务类型再采集，且 Android 12 不允许在后台这样做，
+ *    失败时引导用户从 App 内开启，而不是静默失败；
+ * 4. MediaProjection 必须先升级 mediaProjection 类型再 getMediaProjection，
+ *    并注册 Callback，投影停止时立即释放采集；
+ * 5. 所有音频资源统一由 AudioEngine 管理，切换模式不会出现两个 AudioRecord 并存。
+ */
 class OverlayService : Service() {
 
     companion object {
+        private const val TAG = "ReactorOverlay"
         private const val CHANNEL_ID = "reactor_overlay"
         private const val NOTI_ID = 1
+
         const val ACTION_CAPTURE_READY = "com.example.reactor.CAPTURE_READY"
         const val ACTION_REFRESH_BG = "com.example.reactor.REFRESH_BG"
+        const val ACTION_TOGGLE_MIC = "com.example.reactor.TOGGLE_MIC"
+        const val ACTION_STOP_MIC = "com.example.reactor.STOP_MIC"
+        const val ACTION_TO_SYNTH = "com.example.reactor.TO_SYNTH"
+        const val ACTION_REFRESH_CONFIG = "com.example.reactor.REFRESH_CONFIG"
+
+        const val EXTRA_RESULT_CODE = "resultCode"
+        const val EXTRA_RESULT_DATA = "data"
+        const val EXTRA_DISABLE_LARGE = "disableLarge"
+
+        @Volatile
+        var isRunning: Boolean = false
+            private set
     }
 
-    enum class SourceKind { SYNTH, MIC, CAPTURE }
-
-    private lateinit var wm: WindowManager
+    private lateinit var windowManager: WindowManager
     private lateinit var panel: QuickPanel
-    private lateinit var noti: Notification
 
     private lateinit var smallRoot: FrameLayout
     private lateinit var smallReactor: ReactorView
@@ -53,361 +90,805 @@ class OverlayService : Service() {
     private lateinit var largeParams: WindowManager.LayoutParams
 
     private val handler = Handler(Looper.getMainLooper())
-    private val synth = SynthSource(bandCount = 48, loopSeconds = 8f)
-    private val mic = MicSource(bandCount = 48)
-    private var captureSource: CaptureSource? = null
-    private var projectionRef: MediaProjection? = null
+    private val engine = AudioEngine(bandCount = 48)
+    private val frameBuffer = FloatArray(48)
 
-    private var currentSource = SourceKind.SYNTH
-    private val frameBuf = FloatArray(48)
-    private var t = 0f
-    private var lastMs = 0L
     private var config = ReactorConfig()
+    private var lastFrameMs = 0L
+    private var frameScheduled = false
 
-    private var launcherPkg: String? = null
+    private var projection: MediaProjection? = null
+    private var projectionCallback: MediaProjection.Callback? = null
+    private var foregroundType = 0
+
+    private var launcherPackage: String? = null
     private var onLauncher = false
     private var lastVisibilityCheck = 0L
     private var largeEnabled = true
     private var smallEnabled = true
+    private var usagePermissionWarned = false
+    private var screenOn = true
 
-    private var bgDecodeToken = 0
-    private var silentFrames = 0
+    private var backgroundToken = 0
 
-    private var downRawX = 0f; private var downRawY = 0f
-    private var startX = 0; private var startY = 0
+    private var downRawX = 0f
+    private var downRawY = 0f
+    private var startX = 0
+    private var startY = 0
     private var downMs = 0L
     private var dragging = false
     private var longFired = false
-    private val slop = 14f
-    private val longPressRunnable = Runnable { longFired = true; showPanel() }
+    private val touchSlop = 14f
+    private val longPressRunnable = Runnable {
+        longFired = true
+        showPanel()
+    }
 
-    private val configListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ -> handler.post { applyConfig() } }
+    private val configListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        handler.post { applyConfig() }
+    }
 
     private val screenReceiver = object : BroadcastReceiver() {
-        override fun onReceive(c: Context?, i: Intent?) {
-            if (i?.action == Intent.ACTION_SCREEN_OFF) {
-                mic.stop()
-                captureSource?.stop(); captureSource = null
-                projectionRef?.stop(); projectionRef = null
-                if (currentSource != SourceKind.SYNTH) currentSource = SourceKind.SYNTH
+        override fun onReceive(ctx: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    screenOn = false
+                    // 息屏后没必要继续跑渲染；采集也停掉，避免长期占用麦克风/投影
+                    stopFrameLoop()
+                    if (engine.currentMode() != SourceKind.SYNTH) engine.switchTo(SourceKind.SYNTH)
+                    releaseProjection()
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    screenOn = true
+                    startFrameLoop()
+                }
+                Intent.ACTION_USER_PRESENT -> {
+                    screenOn = true
+                    startFrameLoop()
+                }
             }
         }
     }
 
-    override fun onBind(intent: Intent?) = null
+    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        startForegroundCompat()
-        wm = getSystemService(WINDOW_SERVICE) as WindowManager
-        config = ReactorConfig.load(this)
+        isRunning = true
+        startAsForeground()
 
-        initLauncherPkg()
+        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        config = ReactorConfig.load(this)
+        engine.adaptiveGain = config.adaptiveGain
+        engine.sensitivity = config.sensitivity
+        engine.onSourceDied = { reason ->
+            handler.post {
+                toast("音频中断：$reason，已切回演示信号")
+                engine.switchTo(SourceKind.SYNTH)
+                refreshForegroundType()
+                updateNotification()
+            }
+        }
+
+        resolveLauncherPackage()
         buildLargeLayer()
         buildSmallLayer()
+        panel = QuickPanel(this) { action -> handlePanelAction(action) }
 
-        panel = QuickPanel(this) { action -> onPanelAction(action) }
+        val largeAdded = addWindowSafely(largeRoot, largeParams, "大窗")
+        val smallAdded = addWindowSafely(smallRoot, smallParams, "小窗")
+        if (!smallAdded && !largeAdded) {
+            // 悬浮窗权限没了，直接收摊，别留一个看不见的服务
+            toast("没有悬浮窗权限，已停止")
+            stopSelf()
+            return
+        }
 
-        wm.addView(largeRoot, largeParams)
-        wm.addView(smallRoot, smallParams)
-        wm.addView(panel.root, panel.lp)
+        applyConfigToViews()
+        getSharedPreferences(ReactorConfig.PREF, MODE_PRIVATE)
+            .registerOnSharedPreferenceChangeListener(configListener)
 
-        largeReactor.applyConfig(config.copy(rodDensity = ReactorConfig.RodDensity.SPARSE))
-        smallReactor.applyConfig(config)
-        mic.setAdaptiveGain(config.adaptiveGain)
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        registerReceiver(screenReceiver, filter)
 
-        getSharedPreferences(ReactorConfig.PREF, MODE_PRIVATE).registerOnSharedPreferenceChangeListener(configListener)
-        registerReceiver(screenReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
+        // 默认用演示信号，无需任何权限就能看到效果
+        engine.switchTo(SourceKind.SYNTH)
 
         handler.post { applyBackground() }
-        handler.postDelayed(frameTick, 1000L / config.fps)
         updateLayerVisibility(force = true)
+        startFrameLoop()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent != null) {
-            largeEnabled = !(intent.getBooleanExtra("disableLarge", false))
-        }
-        when (intent?.action) {
-            ACTION_CAPTURE_READY -> {
-                val rc = intent.getIntExtra("resultCode", Activity.RESULT_CANCELED)
-                @Suppress("DEPRECATION") val data = intent.getParcelableExtra<Intent>("data")
-                if (rc == Activity.RESULT_OK && data != null) startCapture(rc, data)
-            }
-            ACTION_REFRESH_BG -> applyBackground()
-        }
+        intent?.let { handleIntent(it) }
         return START_STICKY
     }
 
-    private fun overlayType(): Int = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+    private fun handleIntent(intent: Intent) {
+        when (intent.action) {
+            ACTION_CAPTURE_READY -> {
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0)
+                @Suppress("DEPRECATION")
+                val data = intent.getParcelableExtra<Intent>(EXTRA_RESULT_DATA)
+                if (data != null && resultCode == android.app.Activity.RESULT_OK) {
+                    startCapture(resultCode, data)
+                } else {
+                    toast("录屏授权被取消")
+                }
+            }
+            ACTION_REFRESH_BG -> applyBackground()
+            ACTION_TOGGLE_MIC -> enableMic()
+            ACTION_STOP_MIC -> {
+                if (engine.currentMode() == SourceKind.MIC) switchToSynth()
+            }
+            ACTION_TO_SYNTH -> switchToSynth()
+            ACTION_REFRESH_CONFIG -> applyConfig()
+            else -> {
+                if (intent.getBooleanExtra(EXTRA_DISABLE_LARGE, false)) {
+                    largeEnabled = false
+                    updateLayerVisibility(force = true)
+                }
+            }
+        }
+    }
+
+    // ==================== 前台服务 ====================
+
+    private fun buildNotification(): Notification {
+        val manager = getSystemService(NotificationManager::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (manager.getNotificationChannel(CHANNEL_ID) == null) {
+                manager.createNotificationChannel(
+                    NotificationChannel(CHANNEL_ID, "控制棒悬浮窗", NotificationManager.IMPORTANCE_LOW).apply {
+                        setShowBadge(false)
+                        enableVibration(false)
+                    }
+                )
+            }
+        }
+        val open = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val stop = PendingIntent.getService(
+            this, 1,
+            Intent(this, OverlayService::class.java).setAction(ACTION_TO_SYNTH),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_stat_reactor)
+            .setContentTitle("控制棒")
+            .setContentText(engine.currentMode().cn + " · 悬浮窗运行中")
+            .setOngoing(true)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setContentIntent(open)
+            .addAction(0, "切回演示", stop)
+            .build()
+    }
+
+    private fun updateNotification() {
+        try {
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.notify(NOTI_ID, buildNotification())
+        } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * 计算当前应该声明的前台服务类型。
+     *
+     * - API 26–28：没有类型概念，走两参 startForeground；
+     * - API 29–33：只有确实需要时才带 microphone / mediaProjection；
+     *   **绝不能带 SPECIAL_USE**（34 才有，31 上传了直接崩）；
+     * - API 34+：必须带类型，用 specialUse 托底。
+     */
+    private fun computeForegroundType(): Int {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return 0
+        var type = 0
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        }
+        if (engine.currentMode() == SourceKind.MIC) {
+            type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        }
+        if (projection != null) {
+            type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        }
+        return type
+    }
+
+    private fun startAsForeground() {
+        try {
+            val type = computeForegroundType()
+            if (type != 0) {
+                startForeground(NOTI_ID, buildNotification(), type)
+                foregroundType = type
+            } else {
+                startForeground(NOTI_ID, buildNotification())
+                foregroundType = 0
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "startForeground 失败，退回不带类型", e)
+            try {
+                startForeground(NOTI_ID, buildNotification())
+                foregroundType = 0
+            } catch (e2: Exception) {
+                Log.e(TAG, "startForeground 兜底也失败", e2)
+            }
+        }
+    }
+
+    /**
+     * 按当前模式与投影状态重新声明前台服务类型。
+     * @return true 表示类型已经带上（或被系统接受）
+     */
+    private fun refreshForegroundType(): Boolean {
+        return try {
+            val type = computeForegroundType()
+            if (type != 0) {
+                startForeground(NOTI_ID, buildNotification(), type)
+                foregroundType = type
+            } else {
+                startForeground(NOTI_ID, buildNotification())
+                foregroundType = 0
+            }
+            true
+        } catch (e: SecurityException) {
+            Log.w(TAG, "升级前台服务类型被拒绝（多半是后台限制）", e)
+            try {
+                startForeground(NOTI_ID, buildNotification())
+                foregroundType = 0
+            } catch (_: Exception) {
+            }
+            false
+        } catch (e: Exception) {
+            Log.w(TAG, "刷新前台服务类型失败", e)
+            false
+        }
+    }
+
+    // ==================== 悬浮窗 ====================
+
+    private fun overlayWindowType(): Int = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
 
     private fun buildLargeLayer() {
         largeParams = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, overlayType(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            overlayWindowType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.START; x = 0; y = 0 }
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+            // 大窗整体略透明，桌面穿透感更强
+            alpha = 0.92f
+        }
+
         largeRoot = FrameLayout(this).apply {
             setBackgroundColor(Color.TRANSPARENT)
-            alpha = 0.55f
             isClickable = false
             isFocusable = false
         }
-        val top = systemBarHeight("status_bar_height")
-        val bottom = systemBarHeight("navigation_bar_height")
-        largeRoot.setPadding(0, top, 0, bottom)
-
         largeReactor = ReactorView(this)
-        largeRoot.addView(largeReactor, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        largeRoot.addView(
+            largeReactor,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
     }
 
     private fun buildSmallLayer() {
         val size = (150 * resources.displayMetrics.density).toInt()
         smallParams = WindowManager.LayoutParams(
-            size, size, overlayType(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            size,
+            size,
+            overlayWindowType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.TOP or Gravity.START; x = 80; y = 300 }
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = (resources.displayMetrics.widthPixels - size) / 2
+            y = resources.displayMetrics.heightPixels / 4
+        }
         smallRoot = FrameLayout(this).apply { setBackgroundColor(Color.TRANSPARENT) }
         smallReactor = ReactorView(this)
-        smallRoot.addView(smallReactor, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        smallRoot.setOnTouchListener { _, e -> handleTouch(e) }
+        smallRoot.addView(
+            smallReactor,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        smallRoot.setOnTouchListener { _, event -> handleTouch(event) }
     }
 
-    private fun systemBarHeight(name: String): Int {
-        val id = resources.getIdentifier(name, "dimen", "android")
-        return if (id > 0) resources.getDimensionPixelSize(id) else 0
-    }
-
-    private fun initLauncherPkg() {
-        val home = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
-        launcherPkg = packageManager.resolveActivity(home, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)?.activityInfo?.packageName
-    }
-
-    private val frameTick = object : Runnable {
-        override fun run() {
-            val now = SystemClock.elapsedRealtime()
-            val dt = if (lastMs == 0L) 1f / config.fps else (now - lastMs) / 1000f
-            lastMs = now
-
-            updateLayerVisibility()
-
-            when (currentSource) {
-                SourceKind.SYNTH -> { t = (t + dt) % 8f; synth.read(t).copyInto(frameBuf) }
-                SourceKind.MIC -> mic.read(frameBuf)
-                SourceKind.CAPTURE -> captureSource?.read(frameBuf) ?: frameBuf.fill(0f)
-            }
-
-            if (currentSource == SourceKind.CAPTURE) {
-                var silent = true
-                for (v in frameBuf) if (v > 0.02f) { silent = false; break }
-                if (silent) { if (++silentFrames == 75) toast("检测不到音频，换个播放源或切麦克风") } else silentFrames = 0
-            }
-
-            val sens = config.sensitivity
-            if (sens != 1f) { for (i in frameBuf.indices) frameBuf[i] = (frameBuf[i] * sens).coerceIn(0f, 1f) }
-
-            if (largeRoot.visibility == View.VISIBLE) largeReactor.update(frameBuf, dt)
-            if (smallRoot.visibility == View.VISIBLE) smallReactor.update(frameBuf, dt)
-
-            handler.postDelayed(this, (1000L / config.fps).coerceAtLeast(1L))
+    private fun addWindowSafely(view: View, params: WindowManager.LayoutParams, name: String): Boolean {
+        return try {
+            windowManager.addView(view, params)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "$name 添加失败", e)
+            false
         }
     }
 
-    private fun checkLauncherForeground(): Boolean {
-        val usm = getSystemService(UsageStatsManager::class.java) ?: return false
-        val end = System.currentTimeMillis()
-        val events = usm.queryEvents(end - 2500, end)
-        var last = ""
-        val e = UsageEvents.Event()
-        while (events.hasNextEvent()) {
-            events.getNextEvent(e)
-            if (e.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND) last = e.packageName
+    private fun resolveLauncherPackage() {
+        launcherPackage = try {
+            val home = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+            @Suppress("DEPRECATION")
+            packageManager.resolveActivity(home, android.content.pm.PackageManager.MATCH_DEFAULT_ONLY)
+                ?.activityInfo?.packageName
+        } catch (_: Exception) {
+            null
         }
-        return last.isNotEmpty() && last == launcherPkg
     }
 
     private fun hasUsagePermission(): Boolean {
         val usm = getSystemService(UsageStatsManager::class.java) ?: return false
-        val end = System.currentTimeMillis()
-        val stats = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, end - 1000, end)
-        return !stats.isNullOrEmpty()
+        return try {
+            val end = System.currentTimeMillis()
+            !usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, end - 1000, end).isNullOrEmpty()
+        } catch (_: Exception) {
+            false
+        }
     }
+
+    private fun isLauncherForeground(): Boolean =
+        launcherPackage?.let { pkg ->
+            val usm = getSystemService(UsageStatsManager::class.java) ?: return@let false
+            try {
+                val end = System.currentTimeMillis()
+                val events = usm.queryEvents(end - 2500, end)
+                var last = ""
+                val event = UsageEvents.Event()
+                while (events.hasNextEvent()) {
+                    events.getNextEvent(event)
+                    if (event.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND ||
+                        event.eventType == UsageEvents.Event.ACTIVITY_RESUMED
+                    ) {
+                        last = event.packageName
+                    }
+                }
+                last.isNotEmpty() && last == pkg
+            } catch (_: Exception) {
+                false
+            }
+        } ?: false
 
     private fun updateLayerVisibility(force: Boolean = false) {
         val now = SystemClock.elapsedRealtime()
-        if (!force && now - lastVisibilityCheck < 1000L) return
+        if (!force && now - lastVisibilityCheck < 800L) return
         lastVisibilityCheck = now
 
-        val launcher = if (hasUsagePermission()) checkLauncherForeground() else false
-        if (launcher == onLauncher && !force) return
-        onLauncher = launcher
+        val canDetect = hasUsagePermission()
+        if (!canDetect && !usagePermissionWarned) {
+            usagePermissionWarned = true
+        }
+        val launcherVisible = canDetect && isLauncherForeground()
 
-        largeRoot.visibility = if (largeEnabled && launcher) View.VISIBLE else View.GONE
-        smallRoot.visibility = if (smallEnabled) View.VISIBLE else View.GONE
+        if (!force && launcherVisible == onLauncher) {
+            // 大小窗开关也可能变，这里仍然同步一次可见性
+            applyVisibility(launcherVisible)
+            return
+        }
+        onLauncher = launcherVisible
+        applyVisibility(launcherVisible)
     }
 
-    private fun handleTouch(e: MotionEvent): Boolean {
-        when (e.actionMasked) {
+    private fun applyVisibility(launcherVisible: Boolean) {
+        if (!::largeRoot.isInitialized || !::smallRoot.isInitialized) return
+        val largeVisible = largeEnabled && launcherVisible
+        largeRoot.visibility = if (largeVisible) View.VISIBLE else View.GONE
+        smallRoot.visibility = if (smallEnabled) View.VISIBLE else View.GONE
+        smallReactor.visibility = if (smallEnabled) View.VISIBLE else View.GONE
+    }
+
+    private fun handleTouch(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
-                downRawX = e.rawX; downRawY = e.rawY
-                startX = smallParams.x; startY = smallParams.y
+                downRawX = event.rawX
+                downRawY = event.rawY
+                startX = smallParams.x
+                startY = smallParams.y
                 downMs = SystemClock.uptimeMillis()
-                dragging = false; longFired = false
-                handler.postDelayed(longPressRunnable, 480L)
+                dragging = false
+                longFired = false
+                handler.postDelayed(longPressRunnable, 460L)
             }
             MotionEvent.ACTION_MOVE -> {
-                val dx = e.rawX - downRawX
-                val dy = e.rawY - downRawY
-                if (!dragging && (abs(dx) > slop || abs(dy) > slop)) { dragging = true; handler.removeCallbacks(longPressRunnable) }
+                val dx = event.rawX - downRawX
+                val dy = event.rawY - downRawY
+                if (!dragging && (abs(dx) > touchSlop || abs(dy) > touchSlop)) {
+                    dragging = true
+                    handler.removeCallbacks(longPressRunnable)
+                }
                 if (dragging) {
                     smallParams.x = (startX + dx).toInt()
                     smallParams.y = (startY + dy).toInt()
-                    wm.updateViewLayout(smallRoot, smallParams)
+                    safeUpdateLayout(smallRoot, smallParams)
                     panel.hide()
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 handler.removeCallbacks(longPressRunnable)
-                if (!dragging && !longFired && SystemClock.uptimeMillis() - downMs < 250L) smallReactor.reset()
-                snapToEdge()
+                if (!dragging && !longFired && SystemClock.uptimeMillis() - downMs < 240L) {
+                    smallReactor.triggerFlash()
+                }
+                if (dragging) snapToEdge()
             }
         }
         return true
     }
 
+    private fun safeUpdateLayout(view: View, params: WindowManager.LayoutParams) {
+        try {
+            windowManager.updateViewLayout(view, params)
+        } catch (e: Exception) {
+            Log.w(TAG, "更新悬浮窗位置失败", e)
+        }
+    }
+
     private fun snapToEdge() {
-        val screenW = resources.displayMetrics.widthPixels
-        smallParams.x = if (smallParams.x + smallParams.width / 2 < screenW / 2) 0 else screenW - smallParams.width
-        wm.updateViewLayout(smallRoot, smallParams)
+        val screenWidth = resources.displayMetrics.widthPixels
+        val margin = (8 * resources.displayMetrics.density).toInt()
+        smallParams.x = if (smallParams.x + smallParams.width / 2 < screenWidth / 2) {
+            margin
+        } else {
+            screenWidth - smallParams.width - margin
+        }
+        safeUpdateLayout(smallRoot, smallParams)
     }
 
     private fun showPanel() {
-        vibrate(20)
+        vibrate(18)
         panel.setBgState(BackgroundManager.getUri(this) != null)
-        panel.show(smallParams.x, smallParams.y, smallParams.width, smallParams.height)
+        panel.setSourceState(engine.currentMode())
+        panel.show(smallParams.x, smallParams.y, smallParams.width, smallParams.height, windowManager)
     }
 
-    private fun onPanelAction(action: QuickPanel.Action) {
+    // ==================== 交互 ====================
+
+    private fun handlePanelAction(action: QuickPanel.Action) {
         when (action) {
-            QuickPanel.Action.TOGGLE_MIC -> {
-                if (currentSource == SourceKind.MIC) { mic.stop(); currentSource = SourceKind.SYNTH; vibrate(15) }
-                else if (hasMicPermission() && mic.start()) {
-                    captureSource?.stop(); captureSource = null; projectionRef?.stop(); projectionRef = null
-                    mic.setAdaptiveGain(config.adaptiveGain); currentSource = SourceKind.MIC; vibrate(15)
-                } else toast("无法启动麦克风，请检查权限")
-            }
-            QuickPanel.Action.TOGGLE_CAPTURE -> {
-                when {
-                    currentSource == SourceKind.CAPTURE -> { captureSource?.stop(); captureSource = null; projectionRef?.stop(); projectionRef = null; currentSource = SourceKind.SYNTH; vibrate(15) }
-                    Build.VERSION.SDK_INT < Build.VERSION_CODES.Q -> toast("系统版本过低，不支持机内捕获")
-                    else -> {
-                        val i = Intent(this, MainActivity::class.java).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); putExtra("action", "request_capture") }
-                        startActivity(i)
-                    }
-                }
-            }
-            QuickPanel.Action.PICK_BG -> {
-                val i = Intent(this, MainActivity::class.java).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); putExtra("action", "pick_background") }
-                startActivity(i)
-            }
+            QuickPanel.Action.TOGGLE_MIC -> enableMic()
+            QuickPanel.Action.TOGGLE_CAPTURE -> toggleCapture()
+            QuickPanel.Action.PICK_BG -> openMain("pick_background")
             QuickPanel.Action.CLEAR_BG -> {
-                BackgroundManager.setUri(this, null); BackgroundManager.setEnabled(this, false); smallReactor.setBackgroundBitmap(null); vibrate(15)
+                BackgroundManager.setUri(this, null)
+                BackgroundManager.setEnabled(this, false)
+                smallReactor.setBackgroundBitmap(null)
+                vibrate(15)
             }
-            QuickPanel.Action.TOGGLE_LARGE -> { largeEnabled = !largeEnabled; updateLayerVisibility(force = true); vibrate(15) }
-            QuickPanel.Action.TOGGLE_SMALL -> { smallEnabled = !smallEnabled; updateLayerVisibility(force = true); vibrate(15) }
-            QuickPanel.Action.RESET -> { smallReactor.reset(); largeReactor.reset() }
-            QuickPanel.Action.SETTINGS -> { startActivity(Intent(this, SettingsActivity::class.java).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }) }
+            QuickPanel.Action.TOGGLE_LARGE -> {
+                largeEnabled = !largeEnabled
+                updateLayerVisibility(force = true)
+                vibrate(15)
+            }
+            QuickPanel.Action.TOGGLE_SMALL -> {
+                smallEnabled = !smallEnabled
+                updateLayerVisibility(force = true)
+                vibrate(15)
+            }
+            QuickPanel.Action.RESET -> {
+                smallReactor.reset()
+                largeReactor.reset()
+            }
+            QuickPanel.Action.SETTINGS -> openMain("settings")
             QuickPanel.Action.CLOSE -> stopSelf()
         }
         panel.hide()
     }
 
-    private fun startCapture(resultCode: Int, data: Intent) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) { toast("系统版本过低"); return }
-        upgradeForegroundType()
-        val mpm = getSystemService(MediaProjectionManager::class.java)
-        val projection = mpm.getMediaProjection(resultCode, data) ?: run { toast("获取投影失败"); return }
-        projection.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() {
-                handler.post {
-                    captureSource?.stop(); captureSource = null
-                    projectionRef?.stop(); projectionRef = null
-                    if (currentSource == SourceKind.CAPTURE) currentSource = SourceKind.SYNTH
+    private fun openMain(action: String) {
+        try {
+            startActivity(
+                Intent(this, MainActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+                    putExtra("action", action)
                 }
-            }
-        }, handler)
-        val src = CaptureSource(this, projection, bandCount = 48)
-        src.setAdaptiveGain(config.adaptiveGain)
-        if (!src.start()) { projection.stop(); toast("机内音频启动失败，此应用可能禁止被录制"); return }
-        captureSource?.stop(); captureSource = src; projectionRef = projection; mic.stop()
-        currentSource = SourceKind.CAPTURE; vibrate(15)
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "无法打开主界面", e)
+        }
     }
 
-    private fun applyBackground() {
-        if (!BackgroundManager.isEnabled(this)) { smallReactor.setBackgroundBitmap(null); return }
-        val uri = BackgroundManager.getUri(this) ?: run { smallReactor.setBackgroundBitmap(null); return }
-        val myToken = ++bgDecodeToken
-        val tw = smallParams.width; val th = smallParams.height
-        thread(name = "bg-decode") {
-            val bmp = BackgroundManager.decode(this, uri, tw, th)
-            handler.post { if (myToken == bgDecodeToken) smallReactor.setBackgroundBitmap(bmp) }
+    private fun toggleCapture() {
+        when {
+            engine.currentMode() == SourceKind.CAPTURE -> switchToSynth()
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.Q -> toast("系统版本低于 Android 10，不支持机内捕获")
+            else -> openMain("request_capture")
         }
+    }
+
+    private fun enableMic() {
+        if (engine.currentMode() == SourceKind.MIC) {
+            switchToSynth()
+            return
+        }
+        if (!hasMicPermission()) {
+            toast("需要麦克风权限，请从 App 内开启")
+            openMain("request_mic")
+            return
+        }
+
+        // Android 12+ 不允许在后台把前台服务升级成 microphone 类型：
+        // 先尝试声明类型，失败就说明当前处于后台限制下。
+        var promoted = true
+        try {
+            val type = computeForegroundType() or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            startForeground(NOTI_ID, buildNotification(), type)
+            foregroundType = type
+        } catch (e: SecurityException) {
+            Log.w(TAG, "麦克风前台服务类型被系统拒绝", e)
+            promoted = false
+        } catch (e: Exception) {
+            Log.w(TAG, "声明麦克风前台服务类型失败", e)
+            promoted = false
+        }
+
+        val ok = engine.switchTo(SourceKind.MIC)
+        if (!ok) {
+            val reason = AudioStatus.snapshot?.lastError ?: "未知原因"
+            toast("麦克风启动失败：$reason")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !promoted) {
+                toast("Android 12 限制后台启用麦克风，请从 App 内点击开启")
+                openMain("request_mic")
+            }
+            switchToSynth(keepToast = true)
+            return
+        }
+        refreshForegroundType()
+        updateNotification()
+        toast("麦克风已启用")
+    }
+
+    private fun switchToSynth(keepToast: Boolean = false) {
+        engine.switchTo(SourceKind.SYNTH)
+        releaseProjection()
+        refreshForegroundType()
+        updateNotification()
+        if (!keepToast) toast("已切回演示信号")
+    }
+
+    private fun startCapture(resultCode: Int, data: Intent) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            toast("系统版本过低，不支持机内音频")
+            return
+        }
+        // 必须先声明 mediaProjection 类型，再取 projector，否则 Android 14 会抛异常、
+        // Android 12 也会因为类型不匹配而失败
+        releaseProjection()
+
+        val manager = getSystemService(MediaProjectionManager::class.java)
+        val mediaProjection = try {
+            manager.getMediaProjection(resultCode, data)
+        } catch (e: Exception) {
+            Log.e(TAG, "getMediaProjection 失败", e)
+            toast("获取录屏授权失败：${e.javaClass.simpleName}")
+            return
+        }
+        if (mediaProjection == null) {
+            toast("获取录屏授权失败")
+            return
+        }
+
+        projection = mediaProjection
+        val callback = object : MediaProjection.Callback() {
+            override fun onStop() {
+                handler.post {
+                    Log.i(TAG, "MediaProjection 已停止")
+                    if (projection === mediaProjection) {
+                        engine.switchTo(SourceKind.SYNTH)
+                        releaseProjection()
+                        refreshForegroundType()
+                        updateNotification()
+                        toast("录屏授权已结束，已切回演示信号")
+                    }
+                }
+            }
+        }
+        projectionCallback = callback
+        try {
+            mediaProjection.registerCallback(callback, handler)
+        } catch (e: Exception) {
+            Log.w(TAG, "注册投影回调失败", e)
+        }
+
+        if (!refreshForegroundType()) {
+            toast("无法升级前台服务类型，机内音频可能不可用")
+        }
+
+        val ok = engine.switchTo(SourceKind.CAPTURE, mediaProjection)
+        if (!ok) {
+            val reason = AudioStatus.snapshot?.lastError ?: "未知原因"
+            toast("机内音频启动失败：$reason")
+            releaseProjection()
+            refreshForegroundType()
+            return
+        }
+        updateNotification()
+        vibrate(15)
+        toast("机内音频已启用")
+    }
+
+    private fun releaseProjection() {
+        val cb = projectionCallback
+        val p = projection
+        projectionCallback = null
+        projection = null
+        if (cb != null && p != null) {
+            try {
+                p.unregisterCallback(cb)
+            } catch (_: Exception) {
+            }
+        }
+        try {
+            p?.stop()
+        } catch (_: Exception) {
+        }
+    }
+
+    // ==================== 渲染循环 ====================
+
+    private val frameTick = object : Runnable {
+        override fun run() {
+            if (!frameScheduled) return
+            val now = SystemClock.elapsedRealtime()
+            val dt = if (lastFrameMs == 0L) 1f / config.fps else (now - lastFrameMs) / 1000f
+            lastFrameMs = now
+
+            engine.snapshot(frameBuffer)
+
+            val largeVisible = largeRoot.visibility == View.VISIBLE
+            val smallVisible = smallRoot.visibility == View.VISIBLE
+            if (largeVisible) largeReactor.update(frameBuffer, dt)
+            if (smallVisible) smallReactor.update(frameBuffer, dt)
+
+            updateLayerVisibility()
+
+            handler.postDelayed(this, (1000L / config.fps).coerceAtLeast(16L))
+        }
+    }
+
+    private fun startFrameLoop() {
+        if (frameScheduled || !screenOn) return
+        frameScheduled = true
+        lastFrameMs = 0L
+        handler.postDelayed(frameTick, (1000L / config.fps).coerceAtLeast(16L))
+    }
+
+    private fun stopFrameLoop() {
+        frameScheduled = false
+        handler.removeCallbacks(frameTick)
+        lastFrameMs = 0L
+    }
+
+    private fun restartFrameLoop() {
+        stopFrameLoop()
+        startFrameLoop()
+    }
+
+    // ==================== 配置 / 背景 ====================
+
+    private fun applyConfigToViews() {
+        smallReactor.applyConfig(config)
+        // 大窗用稀疏一档，全屏下模块太密会糊成一片
+        largeReactor.applyConfig(
+            config.copy(
+                rodDensity = if (config.rodDensity == ReactorConfig.RodDensity.DENSE) {
+                    ReactorConfig.RodDensity.NORMAL
+                } else {
+                    ReactorConfig.RodDensity.SPARSE
+                }
+            )
+        )
     }
 
     private fun applyConfig() {
         config = ReactorConfig.load(this)
-        smallReactor.applyConfig(config)
-        largeReactor.applyConfig(config.copy(rodDensity = ReactorConfig.RodDensity.SPARSE))
-        mic.setAdaptiveGain(config.adaptiveGain)
-        captureSource?.setAdaptiveGain(config.adaptiveGain)
-        restartFrameTick()
+        engine.adaptiveGain = config.adaptiveGain
+        engine.sensitivity = config.sensitivity
+        applyConfigToViews()
+        restartFrameLoop()
     }
 
-    private fun restartFrameTick() {
-        handler.removeCallbacks(frameTick)
-        lastMs = 0L
-        handler.postDelayed(frameTick, 1000L / config.fps)
-    }
-
-    private fun hasMicPermission(): Boolean = ContextCompat.checkSelfPermission(this, android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED
-
-    private fun vibrate(ms: Long) {
-        val v = getSystemService(VIBRATOR_SERVICE) as? Vibrator ?: return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) v.vibrate(VibrationEffect.createOneShot(ms, VibrationEffect.DEFAULT_AMPLITUDE))
-        else @Suppress("DEPRECATION") v.vibrate(ms)
-    }
-
-    private fun toast(msg: String) { Toast.makeText(this, msg, Toast.LENGTH_SHORT).show() }
-
-    private fun startForegroundCompat() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val nm = getSystemService(NotificationManager::class.java)
-            if (nm.getNotificationChannel(CHANNEL_ID) == null) nm.createNotificationChannel(NotificationChannel(CHANNEL_ID, "Reactor", NotificationManager.IMPORTANCE_LOW))
-            noti = Notification.Builder(this, CHANNEL_ID).setContentTitle("控制棒悬浮窗").setContentText("正在运行").setSmallIcon(android.R.drawable.ic_menu_compass).build()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-                startForeground(NOTI_ID, noti, type)
-            } else startForeground(NOTI_ID, noti)
+    private fun applyBackground() {
+        if (!BackgroundManager.isEnabled(this)) {
+            smallReactor.setBackgroundBitmap(null)
+            return
+        }
+        val uri = BackgroundManager.getUri(this)
+        if (uri == null) {
+            smallReactor.setBackgroundBitmap(null)
+            return
+        }
+        val token = ++backgroundToken
+        val targetW = smallParams.width
+        val targetH = smallParams.height
+        thread(name = "bg-decode", isDaemon = true) {
+            val bitmap = BackgroundManager.decode(this, uri, targetW, targetH)
+            handler.post {
+                if (token == backgroundToken) smallReactor.setBackgroundBitmap(bitmap)
+            }
         }
     }
 
-    private fun upgradeForegroundType() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
-        var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-        if (hasMicPermission() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-        try { startForeground(NOTI_ID, noti, type) } catch (_: Exception) {}
+    // ==================== 杂项 ====================
+
+    private fun hasMicPermission(): Boolean =
+        checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    private fun vibrate(ms: Long) {
+        try {
+            val vibrator = getSystemService(VIBRATOR_SERVICE) as? android.os.Vibrator ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(
+                    android.os.VibrationEffect.createOneShot(ms, android.os.VibrationEffect.DEFAULT_AMPLITUDE)
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(ms)
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun toast(message: String) {
+        try {
+            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+        } catch (_: Exception) {
+        }
     }
 
     override fun onDestroy() {
-        mic.stop(); captureSource?.stop(); captureSource = null; projectionRef?.stop(); projectionRef = null
+        isRunning = false
+        stopFrameLoop()
         handler.removeCallbacksAndMessages(null)
-        try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
-        getSharedPreferences(ReactorConfig.PREF, MODE_PRIVATE).unregisterOnSharedPreferenceChangeListener(configListener)
-        if (::panel.isInitialized) panel.destroy(wm)
-        if (::smallRoot.isInitialized) { try { wm.removeView(smallRoot) } catch (_: Exception) {} }
-        if (::largeRoot.isInitialized) { try { wm.removeView(largeRoot) } catch (_: Exception) {} }
+
+        engine.onSourceDied = null
+        engine.stop()
+        releaseProjection()
+
+        try {
+            unregisterReceiver(screenReceiver)
+        } catch (_: Exception) {
+        }
+        try {
+            getSharedPreferences(ReactorConfig.PREF, MODE_PRIVATE)
+                .unregisterOnSharedPreferenceChangeListener(configListener)
+        } catch (_: Exception) {
+        }
+
+        if (::panel.isInitialized) panel.destroy(windowManager)
+        if (::largeRoot.isInitialized) {
+            try {
+                windowManager.removeView(largeRoot)
+            } catch (_: Exception) {
+            }
+            largeReactor.setBackgroundBitmap(null)
+        }
+        if (::smallRoot.isInitialized) {
+            try {
+                windowManager.removeView(smallRoot)
+            } catch (_: Exception) {
+            }
+        }
         super.onDestroy()
     }
 }

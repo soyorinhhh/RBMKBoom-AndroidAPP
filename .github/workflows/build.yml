@@ -3,10 +3,16 @@ name: Build APK
 on:
   push:
     branches: [ main, master ]
+    tags: [ "v*" ]
+  pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
+    name: Build debug APK
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -18,31 +24,34 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: 'platforms;android-34 build-tools;34.0.0'
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
 
-      - name: Cache Gradle
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
+      # runner 镜像自带 Android SDK（ANDROID_HOME 已配好）。
+      # 不再用 android-actions/setup-android：它会去装已废弃的 "tools" 包，
+      # 在新版 cmdline-tools 上直接 exit 1（实测）。
+      - name: Ensure SDK packages
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" || true
+          echo "--- platforms ---"; ls "$ANDROID_HOME/platforms"
+          echo "--- build-tools ---"; ls "$ANDROID_HOME/build-tools"
 
-      - name: Setup Gradle
-        uses: gradle/gradle-build-action@v3
-        with:
-          gradle-version: 8.2
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
 
-      - name: Build Debug APK
-        run: gradle assembleDebug --no-daemon
+      - name: Build debug APK
+        run: ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Show APK
+        run: |
+          ls -lh app/build/outputs/apk/debug/
+          "$ANDROID_HOME/build-tools/34.0.0/aapt2" dump badging app/build/outputs/apk/debug/app-debug.apk | head -5
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: reactor-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30

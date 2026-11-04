@@ -2,159 +2,342 @@ package com.example.reactor
 
 import android.Manifest
 import android.app.Activity
-import android.app.AlertDialog
-import android.app.usage.UsageStatsManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.widget.Button
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import com.example.reactor.audio.AudioStatus
 import com.example.reactor.ui.BackgroundManager
 import com.example.reactor.ui.OverlayService
 import com.example.reactor.ui.SettingsActivity
 
+/**
+ * 入口与权限中枢。
+ *
+ * 悬浮窗按钮、快捷面板都通过这里回到前台再申请敏感权限：
+ * Android 12 起「后台启动前台服务 + 使用麦克风」会被系统拒绝，
+ * 所以麦克风必须由可见的 Activity 发起。
+ */
 class MainActivity : AppCompatActivity() {
 
-    private val micPermLauncher = registerForActivityResult(
+    private lateinit var statusText: TextView
+    private lateinit var detailText: TextView
+    private val handler = Handler(Looper.getMainLooper())
+
+    private var pendingStartLarge = true
+
+    private val micPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { ensureUsageThenStart() }
+    ) { granted ->
+        if (pendingStartLarge) {
+            if (granted) {
+                startServiceNow()
+            } else {
+                // 没给麦克风也允许启动：演示信号 + 机内音频都不需要它
+                toast("未授予麦克风权限，将以演示信号启动")
+                startServiceNow()
+            }
+        } else {
+            if (granted) {
+                startServiceAction(OverlayService.ACTION_TOGGLE_MIC)
+                toast("正在启用麦克风")
+            } else {
+                toast("没有麦克风权限")
+            }
+            finishIfRequested()
+        }
+    }
+
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) {
+        // 给不给都继续，前台服务本身不依赖通知权限
+    }
 
     private val captureLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
-            val i = Intent(this, OverlayService::class.java).apply {
+            val intent = Intent(this, OverlayService::class.java).apply {
                 action = OverlayService.ACTION_CAPTURE_READY
-                putExtra("resultCode", result.resultCode)
-                putExtra("data", result.data)
+                putExtra(OverlayService.EXTRA_RESULT_CODE, result.resultCode)
+                putExtra(OverlayService.EXTRA_RESULT_DATA, result.data)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i)
-            else startService(i)
+            startServiceCompat(intent)
         } else {
-            Toast.makeText(this, "授权被取消", Toast.LENGTH_SHORT).show()
+            toast("录屏授权被取消")
         }
-        finish()
+        finishIfRequested()
     }
 
-    private val pickBgLauncher = registerForActivityResult(
+    private val pickBackgroundLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
             try {
                 contentResolver.takePersistableUriPermission(
-                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
                 )
-            } catch (_: Exception) {}
+            } catch (_: Exception) {
+            }
             BackgroundManager.setUri(this, uri)
             BackgroundManager.setEnabled(this, true)
-            notifyServiceRefreshBg()
-            Toast.makeText(this, "背景已设置", Toast.LENGTH_SHORT).show()
+            notifyService(OverlayService.ACTION_REFRESH_BG)
+            toast("背景已设置")
         }
-        finish()
+        finishIfRequested()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (handleIntentAction(intent)) return
+
+        // 从快捷面板带过来的指令先处理，处理完直接退出，不闪界面
+        if (handleCommand(intent)) return
 
         setContentView(R.layout.activity_main)
+        statusText = findViewById(R.id.text_status)
+        detailText = findViewById(R.id.text_detail)
 
         findViewById<Button>(R.id.btn_start).setOnClickListener {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
-                && !Settings.canDrawOverlays(this)
-            ) {
-                startActivity(Intent(
-                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                    Uri.parse("package:$packageName")
-                ))
-                Toast.makeText(this, "允许后请返回再次点击", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            ensureMicThenStart()
+            startOverlayFlow()
         }
-
+        findViewById<Button>(R.id.btn_stop).setOnClickListener {
+            stopService(Intent(this, OverlayService::class.java))
+            toast("已停止")
+            refreshStatus()
+        }
         findViewById<Button>(R.id.btn_settings).setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
+        }
+        findViewById<Button>(R.id.btn_permission).setOnClickListener {
+            openPermissionChecklist()
         }
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        handleIntentAction(intent)
+        handleCommand(intent)
     }
 
-    private fun handleIntentAction(intent: Intent?): Boolean {
-        return when (intent?.getStringExtra("action")) {
-            "request_capture" -> { handleCaptureRequest(); true }
-            "pick_background" -> { pickBgLauncher.launch(arrayOf("image/*")); true }
-            else -> false
+    override fun onResume() {
+        super.onResume()
+        if (::statusText.isInitialized) {
+            refreshStatus()
+            handler.post(statusTicker)
         }
     }
 
-    private fun handleCaptureRequest() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            Toast.makeText(this, "系统版本过低，不支持机内音频捕获", Toast.LENGTH_SHORT).show()
-            finish(); return
+    override fun onPause() {
+        super.onPause()
+        handler.removeCallbacks(statusTicker)
+    }
+
+    private val statusTicker = object : Runnable {
+        override fun run() {
+            refreshStatus()
+            handler.postDelayed(this, 700L)
         }
-        val mpm = getSystemService(MediaProjectionManager::class.java)
-        captureLauncher.launch(mpm.createScreenCaptureIntent())
     }
 
-    private fun ensureMicThenStart() {
-        val granted = ContextCompat.checkSelfPermission(
-            this, Manifest.permission.RECORD_AUDIO
-        ) == PackageManager.PERMISSION_GRANTED
-        if (granted) ensureUsageThenStart()
-        else micPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
+    private fun refreshStatus() {
+        if (!::statusText.isInitialized) return
+        val snapshot = AudioStatus.snapshot
+        val running = OverlayService.isRunning
+        statusText.text = when {
+            !running -> "悬浮窗未运行"
+            snapshot == null -> "悬浮窗运行中 · 等待音频数据"
+            else -> snapshot.shortLine()
+        }
+        detailText.text = buildDetail(snapshot)
     }
 
-    private fun ensureUsageThenStart() {
-        if (hasUsagePermission()) {
-            startOverlay()
+    private fun buildDetail(snapshot: com.example.reactor.audio.AudioDiagnostics?): String {
+        val builder = StringBuilder()
+        builder.append("悬浮窗权限：").append(if (Settings.canDrawOverlays(this)) "已授权" else "未授权").append('\n')
+        builder.append("使用情况访问：").append(if (hasUsagePermission()) "已授权" else "未授权（大窗不会显示）").append('\n')
+        builder.append("麦克风权限：")
+            .append(
+                if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+                    PackageManager.PERMISSION_GRANTED
+                ) "已授权" else "未授权"
+            ).append('\n')
+        if (snapshot != null) {
+            builder.append("采样率：").append(snapshot.sampleRate).append(" Hz\n")
+            builder.append("编码：").append(snapshot.encoding).append('\n')
+            builder.append("AudioRecord：").append(snapshot.recordState).append('\n')
+            builder.append("read 返回：").append(snapshot.lastReadResult).append('\n')
+            builder.append("RMS：").append("%.4f".format(snapshot.rms))
+                .append("  峰值：").append("%.4f".format(snapshot.peak)).append('\n')
+            builder.append("FFT 最大幅度：").append("%.4f".format(snapshot.fftMax)).append('\n')
+            snapshot.lastError?.let { builder.append("最近错误：").append(it).append('\n') }
+        }
+        return builder.toString().trimEnd()
+    }
+
+    // ==================== 启动流程 ====================
+
+    private fun startOverlayFlow() {
+        if (!Settings.canDrawOverlays(this)) {
+            toast("请先允许「显示在其他应用上层」")
+            startActivity(
+                Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+            )
+            return
+        }
+        ensureNotificationPermission()
+        ensureMicPermissionForStart()
+    }
+
+    private fun ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            // 拒绝也不影响前台服务本身，只是看不到通知
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    private fun ensureMicPermissionForStart() {
+        val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        if (granted) startServiceNow()
+        else micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+    }
+
+    private fun startServiceNow() {
+        val intent = Intent(this, OverlayService::class.java).apply {
+            putExtra(OverlayService.EXTRA_DISABLE_LARGE, !hasUsagePermission())
+        }
+        startServiceCompat(intent)
+        toast("悬浮窗已启动")
+        refreshStatus()
+    }
+
+    /**
+     * 麦克风需要「可见的 Activity」才能合法启用：
+     * Android 12 不允许后台把前台服务升级成 microphone 类型。
+     */
+    private fun enableMicFromForeground() {
+        if (!OverlayService.isRunning) {
+            startServiceNow()
+        }
+        val granted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            startServiceAction(OverlayService.ACTION_TOGGLE_MIC)
+            toast("正在启用麦克风")
+            finishIfRequested()
         } else {
-            AlertDialog.Builder(this)
-                .setTitle("需要「使用情况访问」")
-                .setMessage("用于判断是否在桌面，切换大/小悬浮窗。\n\n接下来打开的页面找到本应用并允许访问。")
-                .setPositiveButton("去设置") { _, _ ->
-                    startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
-                    Toast.makeText(this, "允许后请返回再次点击启动", Toast.LENGTH_LONG).show()
-                }
-                .setNegativeButton("仅用悬浮层") { _, _ ->
-                    startOverlay(disableLarge = true)
-                }
-                .show()
+            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
+    }
+
+    private fun requestCapture() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            toast("系统版本低于 Android 10，不支持机内音频")
+            finishIfRequested()
+            return
+        }
+        if (!OverlayService.isRunning) startServiceNow()
+        val manager = getSystemService(MediaProjectionManager::class.java)
+        if (manager == null) {
+            toast("系统不支持录屏授权")
+            finishIfRequested()
+            return
+        }
+        captureLauncher.launch(manager.createScreenCaptureIntent())
+    }
+
+    private fun openPermissionChecklist() {
+        val dialog = android.app.AlertDialog.Builder(this)
+            .setTitle("权限检查")
+            .setMessage(
+                "1. 显示在其他应用上层（悬浮窗）\n" +
+                    "2. 使用情况访问（判断是否在桌面，决定大窗显示）\n" +
+                    "3. 麦克风（麦克风模式需要）\n\n" +
+                    "点「去开启」会依次跳到对应系统页面。"
+            )
+            .setPositiveButton("去开启") { _, _ ->
+                if (!Settings.canDrawOverlays(this)) {
+                    startActivity(
+                        Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                    )
+                } else if (!hasUsagePermission()) {
+                    startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                } else {
+                    micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                }
+            }
+            .setNegativeButton("关闭", null)
+            .create()
+        dialog.show()
+    }
+
+    // ==================== 指令分发 ====================
+
+    private fun handleCommand(intent: Intent?): Boolean {
+        val action = intent?.getStringExtra("action") ?: return false
+        pendingStartLarge = false
+        when (action) {
+            "request_capture" -> requestCapture()
+            "request_mic" -> enableMicFromForeground()
+            "pick_background" -> pickBackgroundLauncher.launch(arrayOf("image/*"))
+            "settings" -> {
+                startActivity(Intent(this, SettingsActivity::class.java))
+                finish()
+            }
+            else -> return false
+        }
+        return true
+    }
+
+    /** 由面板/通知进入时，处理完就退出，不要停在空界面上。 */
+    private fun finishIfRequested() {
+        if (!pendingStartLarge) finish()
     }
 
     private fun hasUsagePermission(): Boolean {
-        val usm = getSystemService(UsageStatsManager::class.java) ?: return false
-        val end = System.currentTimeMillis()
-        val stats = usm.queryUsageStats(UsageStatsManager.INTERVAL_DAILY, end - 1000, end)
-        return !stats.isNullOrEmpty()
-    }
-
-    private fun startOverlay(disableLarge: Boolean = false) {
-        val i = Intent(this, OverlayService::class.java).apply {
-            if (disableLarge) putExtra("disableLarge", true)
+        val manager = getSystemService(android.app.usage.UsageStatsManager::class.java) ?: return false
+        return try {
+            val end = System.currentTimeMillis()
+            !manager.queryUsageStats(android.app.usage.UsageStatsManager.INTERVAL_DAILY, end - 1000, end)
+                .isNullOrEmpty()
+        } catch (_: Exception) {
+            false
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i)
-        else startService(i)
-        finish()
     }
 
-    private fun notifyServiceRefreshBg() {
+    private fun startServiceAction(action: String) {
+        startServiceCompat(Intent(this, OverlayService::class.java).setAction(action))
+    }
+
+    private fun notifyService(action: String) {
+        startServiceAction(action)
+    }
+
+    private fun startServiceCompat(intent: Intent) {
         try {
-            val i = Intent(this, OverlayService::class.java).apply {
-                action = OverlayService.ACTION_REFRESH_BG
-            }
-            startService(i)
-        } catch (_: Exception) {}
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent)
+            else startService(intent)
+        } catch (e: Exception) {
+            toast("启动失败：${e.javaClass.simpleName}")
+        }
+    }
+
+    private fun toast(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 }

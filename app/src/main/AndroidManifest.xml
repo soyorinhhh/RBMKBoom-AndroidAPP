@@ -3,25 +3,36 @@
     xmlns:tools="http://schemas.android.com/tools">
 
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.VIBRATE" />
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- 麦克风 / 录屏 两类前台服务用到的权限（API 34 起才需要单独声明） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"
+        tools:targetApi="34" />
+
+    <!-- Android 13+ 展示前台服务通知 -->
+    <uses-permission
+        android:name="android.permission.POST_NOTIFICATIONS"
+        tools:targetApi="33" />
+
     <uses-permission
         android:name="android.permission.PACKAGE_USAGE_STATS"
         tools:ignore="ProtectedPermissions" />
 
     <application
         android:allowBackup="true"
-        android:icon="@android:drawable/sym_def_app_icon"
-        android:label="控制棒"
+        android:icon="@drawable/ic_launcher"
+        android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+        android:theme="@style/Theme.Reactor">
 
         <activity
             android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
             android:exported="true"
             android:launchMode="singleTask">
             <intent-filter>
@@ -33,15 +44,23 @@
         <activity
             android:name=".ui.SettingsActivity"
             android:exported="false"
-            android:label="控制棒设置" />
+            android:label="@string/app_name" />
 
+        <!--
+            foregroundServiceType 说明：
+            specialUse 是 API 34 引入的类型，在 Android 12 上声明它没有问题（未知位会被忽略），
+            但运行时绝对不能把它传给 startForeground —— 初版就是在这里崩的。
+            运行时类型由 OverlayService.computeForegroundType() 按版本裁剪。
+        -->
         <service
             android:name=".ui.OverlayService"
             android:exported="false"
-            android:foregroundServiceType="specialUse|microphone|mediaProjection">
+            android:foregroundServiceType="specialUse|microphone|mediaProjection"
+            tools:targetApi="34">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="desktop_toy_overlay" />
+                android:value="desktop_audio_visualizer_overlay"
+                tools:targetApi="34" />
         </service>
     </application>
 </manifest>

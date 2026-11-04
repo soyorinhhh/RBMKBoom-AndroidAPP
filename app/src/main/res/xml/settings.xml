@@ -6,11 +6,11 @@
             app:key="sensitivity"
             app:title="灵敏度"
             app:defaultValue="10"
-            app:showSeekBarValue="false" />
+            app:showSeekBarValue="true" />
         <SwitchPreferenceCompat
             app:key="adaptiveGain"
             app:title="自适应增益"
-            app:summary="安静时自动放大，避免神经质"
+            app:summary="安静时自动放大，声音大时自动收，避免频谱贴顶"
             app:defaultValue="true" />
     </PreferenceCategory>
 
@@ -32,7 +32,7 @@
     <PreferenceCategory app:title="视觉">
         <ListPreference
             app:key="rodDensity"
-            app:title="控制棒密度"
+            app:title="模块密度"
             app:entries="@array/density_labels"
             app:entryValues="@array/density_values"
             app:defaultValue="NORMAL" />

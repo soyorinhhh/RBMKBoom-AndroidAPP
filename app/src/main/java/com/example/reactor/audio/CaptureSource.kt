@@ -1,110 +1,203 @@
 package com.example.reactor.audio
 
-import android.content.Context
-import android.media.*
+import android.annotation.SuppressLint
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioPlaybackCaptureConfiguration
+import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import android.os.Build
 import androidx.annotation.RequiresApi
-import kotlin.concurrent.thread
 
+/**
+ * 机内播放音频捕获（Android 10+）。
+ *
+ * 相对初版的修复点：
+ * - MediaProjection 已失效时 `AudioPlaybackCaptureConfiguration.Builder` / `AudioRecord.Builder`
+ *   会抛异常，这里逐个 try 住并把原因写进 lastError，不再静默返回 false；
+ * - 注册 MediaProjection.Callback，用户点「停止共享」或投影被系统回收时立刻标记失效，
+ *   避免后续一直读一个死掉的 AudioRecord；
+ * - `stop()` 同样先 stop 再 release，保证阻塞读能立刻返回；
+ * - 拒绝被捕获的应用（如部分播放器）会一直读 0，这里与「静音」区分开，交给引擎判断。
+ */
 @RequiresApi(Build.VERSION_CODES.Q)
 class CaptureSource(
-    private val context: Context,
     private val projection: MediaProjection,
-    private val bandCount: Int = 48
-) {
-    companion object {
-        private const val SAMPLE_RATE = 44100
-        private const val FFT_SIZE = 1024
-        private const val CHANNEL = AudioFormat.CHANNEL_IN_MONO
-        private const val ENCODING = AudioFormat.ENCODING_PCM_FLOAT
-    }
+    private val preferredSampleRate: Int = 44100,
+    private val targetSamples: Int = 1024,
+    private val onFatalError: ((String) -> Unit)? = null
+) : PcmSource {
 
-    private val analyzer = SpectrumAnalyzer(FFT_SIZE, bandCount)
-    private val latest = FloatArray(bandCount)
-    private val lock = Any()
+    override val label: String = "CAPTURE"
 
+    @Volatile override var sampleRate: Int = preferredSampleRate
+        private set
+
+    override val encodingName: String get() = "PCM 16bit mono (playback capture)"
+
+    @Volatile override var lastError: String? = null
+        private set
+
+    @Volatile override var lastReadResult: Int = 0
+        private set
+
+    @Volatile private var record: AudioRecord? = null
     @Volatile private var running = false
-    @Volatile private var adaptiveGainEnabled = true
-    private var gain = 1f
-    private var worker: Thread? = null
-    private var record: AudioRecord? = null
+    @Volatile private var projectionStopped = false
+    @Volatile private var callback: MediaProjection.Callback? = null
 
-    fun setAdaptiveGain(v: Boolean) { adaptiveGainEnabled = v }
-
-    fun start(): Boolean {
-        if (running) return true
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
-
-        val config = AudioPlaybackCaptureConfiguration.Builder(projection)
-            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-            .addMatchingUsage(AudioAttributes.USAGE_GAME)
-            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-            .build()
-
-        val format = AudioFormat.Builder()
-            .setEncoding(ENCODING)
-            .setSampleRate(SAMPLE_RATE)
-            .setChannelMask(CHANNEL)
-            .build()
-
-        val minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNEL, ENCODING)
-        val bufSize = maxOf(minBuf, FFT_SIZE * 4 * 2)
-
-        return try {
-            val rec = AudioRecord.Builder()
-                .setAudioFormat(format)
-                .setBufferSizeInBytes(bufSize)
-                .setAudioPlaybackCaptureConfig(config)
-                .build()
-
-            if (rec.state != AudioRecord.STATE_INITIALIZED) {
-                rec.release(); return false
-            }
-
-            record = rec
-            running = true
-            rec.startRecording()
-
-            worker = thread(name = "capture-source", isDaemon = true) {
-                val buf = FloatArray(FFT_SIZE)
-                while (running) {
-                    val n = rec.read(buf, 0, FFT_SIZE, AudioRecord.READ_BLOCKING)
-                    if (n <= 0) { Thread.sleep(8); continue }
-                    if (n < FFT_SIZE) continue
-                    val bands = analyzer.analyze(buf, 0)
-                    if (adaptiveGainEnabled) applyGain(bands)
-                    synchronized(lock) {
-                        System.arraycopy(bands, 0, latest, 0, bandCount)
-                    }
-                }
-            }
-            true
-        } catch (_: Exception) { false }
-    }
-
-    private fun applyGain(bands: FloatArray) {
-        var peak = 0f
-        for (v in bands) if (v > peak) peak = v
-        val target = if (peak > 0.02f) 0.85f / peak else 1f
-        gain += (target - gain) * 0.05f
-        gain = gain.coerceIn(0.5f, 4f)
-        for (i in bands.indices) bands[i] = (bands[i] * gain).coerceIn(0f, 1f)
-    }
-
-    fun read(out: FloatArray) {
-        synchronized(lock) {
-            System.arraycopy(latest, 0, out, 0, minOf(out.size, latest.size))
+    /** 由 AudioEngine 的线程调用。 */
+    override fun start(): Boolean {
+        if (record != null) return true
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            lastError = "系统版本低于 Android 10，不支持机内音频捕获"
+            return false
         }
+        lastError = null
+        projectionStopped = false
+
+        val cb = object : MediaProjection.Callback() {
+            override fun onStop() {
+                projectionStopped = true
+                running = false
+                onFatalError?.invoke("录屏授权已停止，机内音频中断")
+            }
+        }
+        callback = cb
+        try {
+            projection.registerCallback(cb, null)
+        } catch (e: Exception) {
+            lastError = "注册 MediaProjection 回调失败：${e.javaClass.simpleName} ${e.message ?: ""}"
+            // 回调注册失败不致命，继续尝试采集
+        }
+
+        val rates = intArrayOf(preferredSampleRate, 48000, 44100).distinct().filter { it > 0 }
+        var lastFailure = "机内音频初始化失败"
+
+        for (rate in rates) {
+            val config = try {
+                AudioPlaybackCaptureConfiguration.Builder(projection)
+                    .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                    .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                    .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                    .build()
+            } catch (e: Exception) {
+                lastFailure = "播放捕获配置失败（投影可能已失效）：${e.javaClass.simpleName} ${e.message ?: ""}"
+                break
+            }
+
+            val minBuf = AudioRecord.getMinBufferSize(
+                rate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            val bufSize = maxOf(if (minBuf > 0) minBuf else 0, targetSamples * 2 * 2)
+
+            var created: AudioRecord? = null
+            try {
+                created = AudioRecord.Builder()
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(rate)
+                            .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(bufSize)
+                    .setAudioPlaybackCaptureConfig(config)
+                    .build()
+            } catch (e: Exception) {
+                lastFailure = "AudioRecord 构造失败（$rate Hz）：${e.javaClass.simpleName} ${e.message ?: ""}"
+                try { created?.release() } catch (_: Exception) {}
+                continue
+            }
+
+            if (created.state != AudioRecord.STATE_INITIALIZED) {
+                lastFailure = "$rate Hz 下 AudioRecord 未初始化"
+                safeRelease(created)
+                continue
+            }
+
+            try {
+                created.startRecording()
+            } catch (e: Exception) {
+                lastFailure = "startRecording 失败：${e.javaClass.simpleName} ${e.message ?: ""}"
+                safeRelease(created)
+                continue
+            }
+            if (created.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                lastFailure = "startRecording 后状态异常（recordingState=${created.recordingState}）"
+                safeRelease(created)
+                continue
+            }
+
+            sampleRate = rate
+            record = created
+            running = true
+            lastError = null
+            return true
+        }
+
+        lastError = lastFailure
+        unregisterCallback()
+        return false
     }
 
-    fun stop() {
+    override fun readPcm(dst: ShortArray): Int {
+        if (projectionStopped) return AudioRecord.ERROR_DEAD_OBJECT
+        val rec = record ?: return AudioRecord.ERROR_INVALID_OPERATION
+        if (!running) return AudioRecord.ERROR_INVALID_OPERATION
+        val result = try {
+            rec.read(dst, 0, dst.size)
+        } catch (e: Exception) {
+            lastError = "read 抛异常：${e.javaClass.simpleName} ${e.message ?: ""}"
+            AudioRecord.ERROR_INVALID_OPERATION
+        }
+        lastReadResult = result
+        if (result < 0) {
+            val reason = when (result) {
+                AudioRecord.ERROR_DEAD_OBJECT -> "捕获对象失效（ERROR_DEAD_OBJECT）"
+                AudioRecord.ERROR_INVALID_OPERATION -> "捕获操作非法（ERROR_INVALID_OPERATION）"
+                AudioRecord.ERROR_BAD_VALUE -> "参数非法（ERROR_BAD_VALUE）"
+                else -> "read 返回 $result"
+            }
+            lastError = reason
+            running = false
+            onFatalError?.invoke(reason)
+        }
+        return result
+    }
+
+    override fun stop() {
+        val rec = record
         running = false
-        try { worker?.join(400) } catch (_: InterruptedException) {}
-        worker = null
-        try { record?.stop() } catch (_: Exception) {}
-        try { record?.release() } catch (_: Exception) {}
+        try { rec?.stop() } catch (_: Exception) {}
         record = null
-        synchronized(lock) { latest.fill(0f) }
+        if (rec != null) safeRelease(rec)
+        unregisterCallback()
+        lastReadResult = 0
+    }
+
+    private fun unregisterCallback() {
+        val cb = callback ?: return
+        callback = null
+        try { projection.unregisterCallback(cb) } catch (_: Exception) {}
+    }
+
+    override fun recordStateText(): String {
+        if (projectionStopped) return "投影已停止"
+        val rec = record ?: return "未初始化"
+        val state = if (rec.state == AudioRecord.STATE_INITIALIZED) "INITIALIZED" else "UNINITIALIZED"
+        val recording = when (rec.recordingState) {
+            AudioRecord.RECORDSTATE_RECORDING -> "RECORDING"
+            AudioRecord.RECORDSTATE_STOPPED -> "STOPPED"
+            else -> "recordingState=${rec.recordingState}"
+        }
+        return "$state / $recording"
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun safeRelease(rec: AudioRecord) {
+        try { rec.release() } catch (_: Exception) {}
     }
 }
