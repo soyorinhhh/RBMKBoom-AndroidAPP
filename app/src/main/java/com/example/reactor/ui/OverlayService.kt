@@ -878,7 +878,7 @@ class OverlayService : Service() {
 
         smallParams.width = size
         smallParams.height = size
-        smallParams.x = if (wasLeft) (8 * metrics.density).toInt() else width - size - (8 * metrics.density).toInt()
+        smallParams.x = if (wasLeft) (8 * density).toInt() else width - size - (8 * density).toInt()
         smallParams.y = oldY.coerceIn(0, (height - size).coerceAtLeast(0))
         safeUpdateLayout(smallRoot, smallParams)
 
