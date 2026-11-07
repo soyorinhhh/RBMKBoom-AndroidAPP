@@ -424,7 +424,7 @@ class OverlayService : Service() {
     }
 
     private fun buildSmallLayer() {
-        val size = (150 * resources.displayMetrics.density).toInt()
+        val size = (config.smallSizeDp * resources.displayMetrics.density).toInt()
         val screen = screenSize()
         smallParams = WindowManager.LayoutParams(
             size,
@@ -870,7 +870,7 @@ class OverlayService : Service() {
         val screen = screenSize()
         val width = screen[0]
         val height = screen[1]
-        val size = (150 * density).toInt()
+        val size = (config.smallSizeDp * density).toInt()
 
         val oldX = smallParams.x
         val oldY = smallParams.y
@@ -924,11 +924,36 @@ class OverlayService : Service() {
         )
     }
 
+    /**
+     * 按设置实时调整悬浮小窗尺寸。
+     * 以小窗中心为锚点缩放，改尺寸后不会莫名跳到屏幕另一边。
+     */
+    private fun applySmallWindowSize() {
+        if (!::smallRoot.isInitialized || !::smallParams.isInitialized) return
+        val size = (config.smallSizeDp * resources.displayMetrics.density).toInt().coerceAtLeast(1)
+        if (smallParams.width == size && smallParams.height == size) return
+
+        val screen = screenSize()
+        val centerX = smallParams.x + smallParams.width / 2
+        val centerY = smallParams.y + smallParams.height / 2
+        smallParams.width = size
+        smallParams.height = size
+        smallParams.x = (centerX - size / 2).coerceIn(0, (screen[0] - size).coerceAtLeast(0))
+        smallParams.y = (centerY - size / 2).coerceIn(0, (screen[1] - size).coerceAtLeast(0))
+
+        if (smallRoot.isAttachedToWindow) safeUpdateLayout(smallRoot, smallParams)
+        smallReactor.reset()
+        // 背景图是按小窗尺寸裁的，尺寸变了必须重裁，否则会被拉花
+        applyBackground()
+        AppLog.add("窗口", "小窗尺寸 → ${config.smallSizeDp}dp (${size}px)")
+    }
+
     private fun applyConfig() {
         config = ReactorConfig.load(this)
         engine.adaptiveGain = config.adaptiveGain
         engine.sensitivity = config.sensitivity
         applyConfigToViews()
+        applySmallWindowSize()
         restartFrameLoop()
     }
 

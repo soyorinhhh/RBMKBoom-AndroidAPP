@@ -42,5 +42,23 @@
             app:entries="@array/theme_labels"
             app:entryValues="@array/theme_values"
             app:defaultValue="GREEN" />
+        <SwitchPreferenceCompat
+            app:key="chassis"
+            app:title="绿色底盘"
+            app:summary="声场下方的椭圆柔光。关掉后只剩模块本身，更干净也更透"
+            app:defaultValue="false" />
+        <SwitchPreferenceCompat
+            app:key="shake"
+            app:title="画面抖动"
+            app:summary="低频很猛时整体轻微晃动。晕动敏感或投屏时可以关掉"
+            app:defaultValue="false" />
+    </PreferenceCategory>
+
+    <PreferenceCategory app:title="悬浮窗">
+        <SeekBarPreference
+            app:key="smallSize"
+            app:title="小窗大小"
+            app:defaultValue="150"
+            app:showSeekBarValue="true" />
     </PreferenceCategory>
 </PreferenceScreen>

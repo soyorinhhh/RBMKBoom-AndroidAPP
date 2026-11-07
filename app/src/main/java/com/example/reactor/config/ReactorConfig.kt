@@ -15,7 +15,13 @@ data class ReactorConfig(
     val rodDensity: RodDensity = RodDensity.NORMAL,
     val feel: Feel = Feel.NORMAL,
     val theme: Theme = Theme.GREEN,
-    val bandCount: Int = 48
+    val bandCount: Int = 48,
+    /** 声场下面的椭圆底盘（柔光）。默认关：只想要模块本身时可以彻底干净。 */
+    val chassis: Boolean = false,
+    /** 低频很猛时整体轻微抖动。默认关：对晃屏敏感的人可以彻底静止。 */
+    val shake: Boolean = false,
+    /** 悬浮小窗边长（dp）。 */
+    val smallSizeDp: Int = DEFAULT_SMALL_SIZE_DP
 ) {
     /** 控制棒密度：决定环数与每环扇区数。 */
     enum class RodDensity(val rings: Int, val sectors: Int, val label: String) {
@@ -49,6 +55,14 @@ data class ReactorConfig(
         const val KEY_ROD_DENSITY = "rodDensity"
         const val KEY_FEEL = "feel"
         const val KEY_THEME = "theme"
+        const val KEY_CHASSIS = "chassis"
+        const val KEY_SHAKE = "shake"
+        const val KEY_SMALL_SIZE = "smallSize"
+
+        /** 悬浮小窗边长的默认值与上下限（dp）。 */
+        const val DEFAULT_SMALL_SIZE_DP = 150
+        const val MIN_SMALL_SIZE_DP = 100
+        const val MAX_SMALL_SIZE_DP = 260
 
         /** 帧率只允许 15 / 20 / 30，其它值一律回落到 15。 */
         private val ALLOWED_FPS = setOf(15, 20, 30)
@@ -70,9 +84,22 @@ data class ReactorConfig(
                 adaptiveGain = runCatching { p.getBoolean(KEY_ADAPTIVE_GAIN, true) }.getOrDefault(true),
                 rodDensity = enumOr(runCatching { p.getString(KEY_ROD_DENSITY, null) }.getOrNull(), RodDensity.NORMAL),
                 feel = enumOr(runCatching { p.getString(KEY_FEEL, null) }.getOrNull(), Feel.NORMAL),
-                theme = enumOr(runCatching { p.getString(KEY_THEME, null) }.getOrNull(), Theme.GREEN)
+                theme = enumOr(runCatching { p.getString(KEY_THEME, null) }.getOrNull(), Theme.GREEN),
+                chassis = runCatching { p.getBoolean(KEY_CHASSIS, false) }.getOrDefault(false),
+                shake = runCatching { p.getBoolean(KEY_SHAKE, false) }.getOrDefault(false),
+                smallSizeDp = intOr(p, KEY_SMALL_SIZE, DEFAULT_SMALL_SIZE_DP)
+                    .coerceIn(MIN_SMALL_SIZE_DP, MAX_SMALL_SIZE_DP)
             )
         }
+
+        /**
+         * 读一个 int 偏好：旧版本 / 手改可能把它存成字符串，两种都试一遍再回落。
+         */
+        private fun intOr(p: android.content.SharedPreferences, key: String, fallback: Int): Int =
+            runCatching { p.getInt(key, fallback) }
+                .getOrElse {
+                    runCatching { p.getString(key, null)?.toIntOrNull() }.getOrNull() ?: fallback
+                }
 
         private inline fun <reified T : Enum<T>> enumOr(name: String?, fallback: T): T =
             if (name == null) fallback

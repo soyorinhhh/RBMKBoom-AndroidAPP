@@ -81,6 +81,10 @@ class ReactorView @JvmOverloads constructor(
     private var shake = 0f
     private var flash = 0f
 
+    /** 椭圆底盘 / 整体抖动，两个都可以在设置里关掉（默认关）。 */
+    private var showChassis = false
+    private var shakeEnabled = false
+
     private var dirtyGeometry = true
 
     fun applyConfig(cfg: ReactorConfig) {
@@ -88,6 +92,9 @@ class ReactorView @JvmOverloads constructor(
         damping = cfg.feel.damping
         theme = cfg.theme
         bandCount = cfg.bandCount
+        showChassis = cfg.chassis
+        shakeEnabled = cfg.shake
+        if (!shakeEnabled) shake = 0f
         applyTheme(cfg.theme)
         if (densityPreset != cfg.rodDensity) {
             densityPreset = cfg.rodDensity
@@ -203,7 +210,12 @@ class ReactorView @JvmOverloads constructor(
         val avg = sum / n
         val targetPressure = (avg / (maxHeight * 0.8f)).coerceIn(0f, 1f)
         pressure += (targetPressure - pressure) * minOf(1f, step * 8f)
-        val targetShake = ((pressure - 0.72f).coerceAtLeast(0f)) * 14f * density
+        // 关掉抖动时不累加位移，直接归零，免得下次打开时先弹一下
+        val targetShake = if (shakeEnabled) {
+            ((pressure - 0.72f).coerceAtLeast(0f)) * 14f * density
+        } else {
+            0f
+        }
         shake += (targetShake - shake) * minOf(1f, step * 10f)
         if (flash > 0f) flash = (flash - step * 2.2f).coerceAtLeast(0f)
 
@@ -349,6 +361,7 @@ class ReactorView @JvmOverloads constructor(
 
     /** 椭圆底盘 + 柔光，只覆盖声场范围，不铺满整窗（保持悬浮窗透明）。 */
     private fun drawFloor(canvas: Canvas) {
+        if (!showChassis) return
         if (fieldRadiusX <= 0f) return
         val shader = floorShader ?: RadialGradient(
             centerX, centerY, fieldRadiusX,

@@ -35,6 +35,12 @@ class SettingsActivity : AppCompatActivity() {
                 max = 30
                 setSummaryProvider { "${value / 10f}x" }
             }
+
+            findPreference<SeekBarPreference>(ReactorConfig.KEY_SMALL_SIZE)?.apply {
+                min = ReactorConfig.MIN_SMALL_SIZE_DP
+                max = ReactorConfig.MAX_SMALL_SIZE_DP
+                setSummaryProvider { "$value dp" }
+            }
         }
     }
 }
