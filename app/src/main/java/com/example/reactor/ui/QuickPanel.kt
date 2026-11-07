@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -142,9 +143,17 @@ class QuickPanel(
      * 视图尚未 attach 时（第一次显示）先按估算尺寸放置，attach 后再校正一次。
      */
     fun show(x: Int, y: Int, w: Int, h: Int, windowManager: WindowManager) {
+        // 注意：这里不能用 resources.displayMetrics —— 横屏时它可能还是竖屏的尺寸
+        // （MuMu 模拟器上实测 displayMetrics 给 540x960，实际显示是 960x540，
+        //  结果面板按 960 高去排，底部直接超出屏幕）。
+        val bounds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            runCatching { windowManager.currentWindowMetrics.bounds }.getOrNull()
+        } else {
+            null
+        }
         val metrics = context.resources.displayMetrics
-        val screenW = metrics.widthPixels
-        val screenH = metrics.heightPixels
+        val screenW = bounds?.width() ?: metrics.widthPixels
+        val screenH = bounds?.height() ?: metrics.heightPixels
 
         val panelW = if (root.width > 0) root.width else (170 * density).toInt()
         val panelH = if (root.height > 0) root.height else (340 * density).toInt()
