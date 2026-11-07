@@ -31,6 +31,11 @@ class QuickPanel(
 
     private val density = context.resources.displayMetrics.density
 
+    companion object {
+        /** 标题行 1 + 选项 9。改了 addItem 的数量要同步改这里。 */
+        private const val ITEM_COUNT = 9
+    }
+
     private val accent = 0xFF7FE0A8.toInt()
     private val dim = 0xFF8FA396.toInt()
     private val panelColor = 0xF2101613.toInt()
@@ -154,8 +159,15 @@ class QuickPanel(
 
         lp.x = targetX
         lp.y = targetY
-        // 每次都从 WRAP_CONTENT 起算，避免上一次在小屏上的限高残留
-        lp.height = WindowManager.LayoutParams.WRAP_CONTENT
+        // 面板固定一个「最多占多少」的高度，超出的部分交给 ScrollView 滚。
+        // 纯 WRAP_CONTENT 在 540px 高的横屏上会超出屏幕，最后几项直接看不到（实机/模拟器都复现）。
+        val contentEstimate = dp(36 + ITEM_COUNT * 44)
+        val maxH = screenH - dp(24)
+        lp.height = minOf(contentEstimate, maxH).coerceAtLeast(dp(160))
+        if (targetY + lp.height > screenH - dp(8)) {
+            targetY = (screenH - lp.height - dp(8)).coerceAtLeast(dp(8))
+            lp.y = targetY
+        }
 
         root.visibility = View.VISIBLE
         try {
@@ -163,33 +175,17 @@ class QuickPanel(
         } catch (_: Exception) {
         }
 
-        // attach 后校正：屏幕矮的时候面板会比屏幕还高，底部选项被切掉（实机 960x540 上遇到过），
-        // 这里把高度夹到屏幕内，交给 ScrollView 滚动。
+        // 真实布局出来后再校一次位置（宽度是估算的，横向可能贴边）
         root.post {
-            val maxH = screenH - dp(20)
-            if (root.height > maxH && maxH > dp(120)) {
-                lp.height = maxH
+            val realW = if (root.width > 0) root.width else panelW
+            var nx = x + w + dp(8)
+            if (nx + realW > screenW - dp(8)) nx = x - realW - dp(8)
+            if (nx < dp(8)) nx = dp(8)
+            if (nx != lp.x) {
+                lp.x = nx
                 try {
                     windowManager.updateViewLayout(root, lp)
                 } catch (_: Exception) {
-                }
-            }
-            val realW = if (root.width > 0) root.width else panelW
-            val realH = if (lp.height > 0) lp.height else root.height
-            if (realW > 0 && realH > 0) {
-                var nx = x + w + dp(8)
-                if (nx + realW > screenW - dp(8)) nx = x - realW - dp(8)
-                if (nx < dp(8)) nx = dp(8)
-                var ny = y
-                if (ny + realH > screenH - dp(8)) ny = screenH - realH - dp(8)
-                if (ny < dp(8)) ny = dp(8)
-                if (nx != lp.x || ny != lp.y) {
-                    lp.x = nx
-                    lp.y = ny
-                    try {
-                        windowManager.updateViewLayout(root, lp)
-                    } catch (_: Exception) {
-                    }
                 }
             }
         }
