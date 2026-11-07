@@ -383,6 +383,10 @@ class ReactorView @JvmOverloads constructor(
     }
 
     private fun drawFieldGlow(canvas: Canvas) {
+        // 和底盘共用同一个开关：这层圆形的压力辉光在暗背景上比底盘显眼得多，
+        // 如果它不跟着关，用户把「绿色底盘」关掉之后画面上仍然有一大团绿光，
+        // 开关看起来就像没生效（实测截图对比确认）。
+        if (!showChassis) return
         if (pressure <= 0.02f) return
         topPaint.color = Color.argb((pressure * 46).toInt().coerceIn(0, 255), glow and 0xFF0000 shr 16, glow shr 8 and 0xFF, glow and 0xFF)
         canvas.drawCircle(centerX, centerY, fieldRadiusX * (0.9f + pressure * 0.25f), topPaint)

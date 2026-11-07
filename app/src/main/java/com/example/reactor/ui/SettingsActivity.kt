@@ -39,7 +39,10 @@ class SettingsActivity : AppCompatActivity() {
             findPreference<SeekBarPreference>(ReactorConfig.KEY_SMALL_SIZE)?.apply {
                 // 范围已经在 settings.xml 的 android:min/max 里声明了（必须在 XML 阶段生效，
                 // 否则 defaultValue=150 会先被 SeekBarPreference 内置的 max=100 夹掉）。
-                setSummaryProvider { "$value dp" }
+                //
+                // 这里不设 summary provider：实测拖动后列表项不会重新绑定，
+                // 底下的 summary 会停在旧值（显示 150 而实际已 225），比不显示更容易误导。
+                // 当前值由 SeekBar 右侧的数字（showSeekBarValue）实时显示。
             }
         }
     }
