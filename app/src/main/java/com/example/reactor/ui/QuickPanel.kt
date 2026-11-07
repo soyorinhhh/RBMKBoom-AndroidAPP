@@ -154,6 +154,8 @@ class QuickPanel(
 
         lp.x = targetX
         lp.y = targetY
+        // 每次都从 WRAP_CONTENT 起算，避免上一次在小屏上的限高残留
+        lp.height = WindowManager.LayoutParams.WRAP_CONTENT
 
         root.visibility = View.VISIBLE
         try {
@@ -161,10 +163,19 @@ class QuickPanel(
         } catch (_: Exception) {
         }
 
-        // attach 后再校正一次，避免第一次估算尺寸不准
+        // attach 后校正：屏幕矮的时候面板会比屏幕还高，底部选项被切掉（实机 960x540 上遇到过），
+        // 这里把高度夹到屏幕内，交给 ScrollView 滚动。
         root.post {
-            val realW = root.width
-            val realH = root.height
+            val maxH = screenH - dp(20)
+            if (root.height > maxH && maxH > dp(120)) {
+                lp.height = maxH
+                try {
+                    windowManager.updateViewLayout(root, lp)
+                } catch (_: Exception) {
+                }
+            }
+            val realW = if (root.width > 0) root.width else panelW
+            val realH = if (lp.height > 0) lp.height else root.height
             if (realW > 0 && realH > 0) {
                 var nx = x + w + dp(8)
                 if (nx + realW > screenW - dp(8)) nx = x - realW - dp(8)

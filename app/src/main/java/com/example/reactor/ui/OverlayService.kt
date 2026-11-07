@@ -186,6 +186,10 @@ class OverlayService : Service() {
 
         val largeAdded = addWindowSafely(largeRoot, largeParams, "大窗")
         val smallAdded = addWindowSafely(smallRoot, smallParams, "小窗")
+        // 面板也必须在这里加进 WindowManager。
+        // 之前重写时漏了这一行，面板只能等看门狗巡检时被补上（实测晚了 1.4 秒），
+        // 真机上表现就是「长按呼不出面板 / 面板一闪就没」。
+        addWindowSafely(panel.root, panel.lp, "面板")
         if (!smallAdded && !largeAdded) {
             // 悬浮窗权限没了，直接收摊，别留一个看不见的服务
             toast("没有悬浮窗权限，已停止")
@@ -402,8 +406,26 @@ class OverlayService : Service() {
         )
     }
 
+    /** 屏幕尺寸：优先 currentWindowMetrics，旋转后它是准的（displayMetrics 可能是旧方向）。 */
+    private fun screenSize(): IntArray {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val bounds = (getSystemService(WINDOW_SERVICE) as WindowManager).currentWindowMetrics.bounds
+                intArrayOf(bounds.width(), bounds.height())
+            } else {
+                val metrics = resources.displayMetrics
+                intArrayOf(metrics.widthPixels, metrics.heightPixels)
+            }
+        } catch (e: Exception) {
+            val metrics = resources.displayMetrics
+            AppLog.add("配置", "读取屏幕尺寸失败，退回 displayMetrics：${e.javaClass.simpleName}")
+            intArrayOf(metrics.widthPixels, metrics.heightPixels)
+        }
+    }
+
     private fun buildSmallLayer() {
         val size = (150 * resources.displayMetrics.density).toInt()
+        val screen = screenSize()
         smallParams = WindowManager.LayoutParams(
             size,
             size,
@@ -414,8 +436,8 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = (resources.displayMetrics.widthPixels - size) / 2
-            y = resources.displayMetrics.heightPixels / 4
+            x = (screen[0] - size) / 2
+            y = screen[1] / 4
         }
         smallRoot = FrameLayout(this).apply { setBackgroundColor(Color.TRANSPARENT) }
         smallReactor = ReactorView(this)
@@ -558,7 +580,7 @@ class OverlayService : Service() {
     }
 
     private fun snapToEdge() {
-        val screenWidth = resources.displayMetrics.widthPixels
+        val screenWidth = screenSize()[0]
         val margin = (8 * resources.displayMetrics.density).toInt()
         smallParams.x = if (smallParams.x + smallParams.width / 2 < screenWidth / 2) {
             margin
@@ -844,10 +866,11 @@ class OverlayService : Service() {
      */
     private fun applyOrientation() {
         if (!::smallRoot.isInitialized || !::largeRoot.isInitialized) return
-        val metrics = resources.displayMetrics
-        val width = metrics.widthPixels
-        val height = metrics.heightPixels
-        val size = (150 * metrics.density).toInt()
+        val density = resources.displayMetrics.density
+        val screen = screenSize()
+        val width = screen[0]
+        val height = screen[1]
+        val size = (150 * density).toInt()
 
         val oldX = smallParams.x
         val oldY = smallParams.y
