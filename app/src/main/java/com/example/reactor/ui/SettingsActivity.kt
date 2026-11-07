@@ -37,8 +37,8 @@ class SettingsActivity : AppCompatActivity() {
             }
 
             findPreference<SeekBarPreference>(ReactorConfig.KEY_SMALL_SIZE)?.apply {
-                min = ReactorConfig.MIN_SMALL_SIZE_DP
-                max = ReactorConfig.MAX_SMALL_SIZE_DP
+                // 范围已经在 settings.xml 的 android:min/max 里声明了（必须在 XML 阶段生效，
+                // 否则 defaultValue=150 会先被 SeekBarPreference 内置的 max=100 夹掉）。
                 setSummaryProvider { "$value dp" }
             }
         }

@@ -55,10 +55,17 @@
     </PreferenceCategory>
 
     <PreferenceCategory app:title="悬浮窗">
+        <!--
+            范围必须写在 XML 的 android:min / android:max 上。
+            SeekBarPreference 内置的 max 是 100，若只在代码里 setMin/setMax，
+            解析 XML 时 defaultValue=150 会先被夹成 100，打开设置页就等于把用户的小窗尺寸改小了（实测踩过）。
+        -->
         <SeekBarPreference
             app:key="smallSize"
             app:title="小窗大小"
             app:defaultValue="150"
+            android:min="100"
+            android:max="260"
             app:showSeekBarValue="true" />
     </PreferenceCategory>
 </PreferenceScreen>
