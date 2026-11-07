@@ -55,16 +55,22 @@ data class ReactorConfig(
 
         fun load(ctx: Context): ReactorConfig {
             val p = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
-            val fps = p.getString(KEY_FPS, null)?.toIntOrNull()?.takeIf { it in ALLOWED_FPS } ?: 15
-            val sensitivityRaw = p.getInt(KEY_SENSITIVITY, 10).coerceIn(0, 100)
+            // 逐项容错：某个键被存成别的类型（旧版本 / 手改）时，不能让整份配置读取崩掉
+            val fps = runCatching { p.getString(KEY_FPS, null) }.getOrNull()
+                ?.toIntOrNull()?.takeIf { it in ALLOWED_FPS } ?: 15
+            val sensitivityRaw = runCatching { p.getInt(KEY_SENSITIVITY, 10) }
+                .getOrElse {
+                    runCatching { p.getString(KEY_SENSITIVITY, null)?.toIntOrNull() }.getOrNull() ?: 10
+                }
+                .coerceIn(2, 30)
             return ReactorConfig(
                 fps = fps,
-                // 0..100 → 0.2..3.0，默认 10 → 1.0
+                // 2..30 → 0.2..3.0，默认 10 → 1.0
                 sensitivity = (sensitivityRaw / 10f).coerceIn(0.2f, 3.0f),
-                adaptiveGain = p.getBoolean(KEY_ADAPTIVE_GAIN, true),
-                rodDensity = enumOr(p.getString(KEY_ROD_DENSITY, null), RodDensity.NORMAL),
-                feel = enumOr(p.getString(KEY_FEEL, null), Feel.NORMAL),
-                theme = enumOr(p.getString(KEY_THEME, null), Theme.GREEN)
+                adaptiveGain = runCatching { p.getBoolean(KEY_ADAPTIVE_GAIN, true) }.getOrDefault(true),
+                rodDensity = enumOr(runCatching { p.getString(KEY_ROD_DENSITY, null) }.getOrNull(), RodDensity.NORMAL),
+                feel = enumOr(runCatching { p.getString(KEY_FEEL, null) }.getOrNull(), Feel.NORMAL),
+                theme = enumOr(runCatching { p.getString(KEY_THEME, null) }.getOrNull(), Theme.GREEN)
             )
         }
 
