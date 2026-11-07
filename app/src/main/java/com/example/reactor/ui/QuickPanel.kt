@@ -35,6 +35,9 @@ class QuickPanel(
     companion object {
         /** 标题行 1 + 选项 9。改了 addItem 的数量要同步改这里。 */
         private const val ITEM_COUNT = 9
+
+        /** 面板高度硬上限：不依赖读到的屏幕尺寸，保证任何机型都放得下。 */
+        private const val MAX_PANEL_HEIGHT_DP = 340
     }
 
     private val accent = 0xFF7FE0A8.toInt()
@@ -168,11 +171,12 @@ class QuickPanel(
 
         lp.x = targetX
         lp.y = targetY
-        // 面板固定一个「最多占多少」的高度，超出的部分交给 ScrollView 滚。
-        // 纯 WRAP_CONTENT 在 540px 高的横屏上会超出屏幕，最后几项直接看不到（实机/模拟器都复现）。
+        // 高度上限用固定 dp，而不是「屏幕高 - 边距」：
+        // Service 上下文拿到的屏幕尺寸可能是竖屏的（MuMu 实测 540x960，实际显示 960x540），
+        // 按它算出来的高度会超出真实屏幕，最后几项被切掉。
+        // 340dp 在任何手机的横竖屏都放得下，多出来的交给 ScrollView 滚动。
         val contentEstimate = dp(36 + ITEM_COUNT * 44)
-        val maxH = screenH - dp(24)
-        lp.height = minOf(contentEstimate, maxH).coerceAtLeast(dp(160))
+        lp.height = minOf(contentEstimate, dp(MAX_PANEL_HEIGHT_DP))
         if (targetY + lp.height > screenH - dp(8)) {
             targetY = (screenH - lp.height - dp(8)).coerceAtLeast(dp(8))
             lp.y = targetY
